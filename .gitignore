@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-companion/
+web-ext-artifacts/
+*.tsbuildinfo
+coverage/
+
+# Secrets and local configuration — never commit these
+.env
+.env.*
+!.env.example
+credentials.json
+pairing-token.json
+.agentlink/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

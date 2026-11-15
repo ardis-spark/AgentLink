@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>AgentLink companion settings</title>
+    <link rel="stylesheet" href="/settings.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="masthead__brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="masthead__name">AgentLink</span>
+        <span class="label">Companion settings</span>
+      </div>
+      <div class="chip" id="gemini-chip" role="status" aria-live="polite">
+        <span class="dot dot--off" id="gemini-dot"></span>
+        <span id="gemini-chip-text">Checking…</span>
+      </div>
+    </header>
+
+    <main class="page" id="page">
+      <section class="panel" id="locked" hidden>
+        <h1 class="panel__title">This page needs its pairing link</h1>
+        <p class="muted">
+          Open the settings link that the companion printed in your terminal when it started. It ends in
+          <span class="mono">/settings#token=…</span> and is what authorises this page to change settings.
+        </p>
+        <p class="muted">You can also paste the pairing token here.</p>
+        <form class="row" id="token-form">
+          <label class="visually-hidden" for="token-input">Pairing token</label>
+          <input class="input input--mono" id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="Pairing token" />
+          <button class="btn btn--primary" type="submit">Unlock</button>
+        </form>
+        <p class="note note--bad" id="token-error" role="alert" hidden></p>
+      </section>
+
+      <div id="content" hidden>
+        <section class="panel" aria-labelledby="key-title">
+          <div class="panel__head">
+            <h1 class="panel__title" id="key-title">Gemini API key</h1>
+            <span class="label" id="key-state">—</span>
+          </div>
+          <p class="muted">
+            The key is stored on this computer only, in a file that only your user account can read. It is used by this
+            companion process to call the Gemini API and is never sent to the browser extension, to Arena, or to any log.
+          </p>
+
+          <dl class="facts" id="key-facts"></dl>
+          <p class="note" id="key-message" role="status" aria-live="polite" hidden></p>
+
+          <form class="stack" id="key-form" autocomplete="off">
+            <div class="field">
+              <label class="label" for="key-input" id="key-label">Enter API key</label>
+              <div class="row">
+                <input class="input input--mono" id="key-input" type="password" name="agentlink-gemini-key" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your Gemini API key" />
+                <button class="btn" type="button" id="key-reveal" aria-pressed="false">Show</button>
+              </div>
+              <p class="field__hint">Create or copy a key in Google AI Studio → API keys. Saving also tests it against the selected model.</p>
+            </div>
+            <div class="row row--wrap">
+              <button class="btn btn--primary" type="submit" id="key-save">Save and test</button>
+              <button class="btn" type="button" id="key-test">Test connection</button>
+              <button class="btn btn--danger" type="button" id="key-remove">Remove saved key</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="model-title">
+          <div class="panel__head">
+            <h2 class="panel__title" id="model-title">Model</h2>
+            <button class="btn btn--small btn--quiet" type="button" id="model-refresh">Refresh list</button>
+          </div>
+          <p class="muted">The list comes from the Gemini API for your key. Changing the model takes effect on the next request; nothing else needs to change.</p>
+          <form class="stack" id="model-form">
+            <div class="grid-2">
+              <div class="field">
+                <label class="label" for="model-select">Coordinator model</label>
+                <select class="select" id="model-select"></select>
+                <p class="field__hint" id="model-detail"></p>
+              </div>
+              <div class="field">
+                <label class="label" for="thinking-select">Thinking level</label>
+                <select class="select" id="thinking-select">
+                  <option value="default">Model default</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+                <p class="field__hint">Lower is faster and cheaper; higher reasons more before answering.</p>
+              </div>
+            </div>
+            <div class="field" id="custom-model-field" hidden>
+              <label class="label" for="model-custom">Model ID</label>
+              <input class="input input--mono" id="model-custom" type="text" spellcheck="false" autocomplete="off" placeholder="for example gemini-4-hydrogen" />
+              <p class="field__hint">Use the exact ID from the Gemini API documentation. It is checked when you save.</p>
+            </div>
+            <p class="note" id="model-message" role="status" aria-live="polite" hidden></p>
+            <div class="row">
+              <button class="btn btn--primary" type="submit" id="model-save">Save model</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="limits-title">
+          <div class="panel__head">
+            <h2 class="panel__title" id="limits-title">Safety limits</h2>
+          </div>
+          <p class="muted">These stop a session from running away. When a limit is reached the session pauses and waits for you.</p>
+          <form class="stack" id="limits-form">
+            <div class="grid-3">
+              <div class="field">
+                <label class="label" for="limit-tasks">Tasks per session</label>
+                <input class="input" id="limit-tasks" type="number" min="1" max="500" step="1" inputmode="numeric" />
+                <p class="field__hint">Tasks sent to Arena before a check-in.</p>
+              </div>
+              <div class="field">
+                <label class="label" for="limit-rounds">Tool rounds per turn</label>
+                <input class="input" id="limit-rounds" type="number" min="1" max="12" step="1" inputmode="numeric" />
+                <p class="field__hint">Planning steps Gemini may take per reply.</p>
+              </div>
+              <div class="field">
+                <label class="label" for="limit-retries">Retries</label>
+                <input class="input" id="limit-retries" type="number" min="0" max="8" step="1" inputmode="numeric" />
+                <p class="field__hint">Extra attempts after a temporary failure.</p>
+              </div>
+            </div>
+            <div class="grid-3">
+              <div class="field">
+                <label class="label" for="limit-first">First output timeout (s)</label>
+                <input class="input" id="limit-first" type="number" min="5" max="3600" step="1" inputmode="numeric" />
+              </div>
+              <div class="field">
+                <label class="label" for="limit-idle">Stall timeout (s)</label>
+                <input class="input" id="limit-idle" type="number" min="5" max="3600" step="1" inputmode="numeric" />
+              </div>
+              <div class="field">
+                <label class="label" for="limit-total">Request timeout (s)</label>
+                <input class="input" id="limit-total" type="number" min="10" max="7200" step="1" inputmode="numeric" />
+              </div>
+            </div>
+            <p class="note" id="limits-message" role="status" aria-live="polite" hidden></p>
+            <div class="row">
+              <button class="btn" type="submit" id="limits-save">Save limits</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="about-title">
+          <div class="panel__head">
+            <h2 class="panel__title" id="about-title">This companion</h2>
+          </div>
+          <dl class="facts" id="about-facts"></dl>
+          <p class="muted">
+            To connect the browser extension, open AgentLink in Zen, go to Settings → Companion, and paste the pairing
+            token shown in the terminal where this companion is running.
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <script src="/settings.js" defer></script>
+  </body>
+</html>

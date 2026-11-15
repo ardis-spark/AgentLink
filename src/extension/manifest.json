@@ -1,0 +1,48 @@
+{
+  "manifest_version": 2,
+  "name": "AgentLink",
+  "version": "0.0.0",
+  "description": "An engineering workspace where Gemini plans the work, you approve each task, and Arena Agent Mode carries it out.",
+  "icons": {
+    "48": "icons/agentlink.svg",
+    "96": "icons/agentlink.svg"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "agentlink@ardis-spark.github.io",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["websiteContent"]
+      }
+    }
+  },
+  "permissions": [
+    "storage",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "*://arena.ai/*",
+    "*://*.arena.ai/*",
+    "*://lmarena.ai/*",
+    "*://*.lmarena.ai/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_icon": "icons/agentlink.svg",
+    "default_title": "Open AgentLink"
+  },
+  "sidebar_action": {
+    "default_icon": "icons/agentlink.svg",
+    "default_title": "AgentLink",
+    "default_panel": "ui/index.html?surface=sidebar",
+    "open_at_install": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://arena.ai/*", "*://*.arena.ai/*", "*://lmarena.ai/*", "*://*.lmarena.ai/*"],
+      "js": ["content/arena.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

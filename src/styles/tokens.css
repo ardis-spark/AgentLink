@@ -1,0 +1,88 @@
+/*
+ * AgentLink visual identity: black surfaces, one red.
+ * Red is the brand and the "act here" colour. State colours (ok / warn) are
+ * deliberately muted so they inform without competing with it.
+ */
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/ibm-plex-sans-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('fonts/ibm-plex-sans-latin-500-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('fonts/ibm-plex-sans-latin-600-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
+}
+
+:root {
+  color-scheme: dark;
+
+  --ink-0: #070606;
+  --ink-1: #0e0c0c;
+  --ink-2: #151212;
+  --ink-3: #1d1919;
+  --ink-4: #272121;
+  --rule: #2a2424;
+  --rule-strong: #453a3a;
+
+  --text: #f0eae7;
+  --text-2: #b8adaa;
+  --text-3: #8d8380;
+
+  --red: #e01e2b;
+  --red-hi: #ff4b57;
+  --red-lo: #8a1119;
+  --red-wash: rgba(224, 30, 43, 0.1);
+  --red-wash-strong: rgba(224, 30, 43, 0.18);
+  --on-red: #ffffff;
+
+  --ok: #5fc48e;
+  --ok-wash: rgba(95, 196, 142, 0.1);
+  --warn: #e3a744;
+  --warn-wash: rgba(227, 167, 68, 0.1);
+
+  --font-ui: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+
+  --fs-micro: 0.6875rem; /* 11px: labels */
+  --fs-small: 0.75rem; /* 12px */
+  --fs-body: 0.875rem; /* 14px */
+  --fs-lead: 1rem;
+  --fs-title: 1.25rem;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+
+  --radius: 3px;
+  --focus: 0 0 0 2px var(--ink-0), 0 0 0 4px var(--red-hi);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
