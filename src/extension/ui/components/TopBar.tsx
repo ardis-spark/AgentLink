@@ -98,17 +98,17 @@ export function TopBar({ state, onOpenSettings, onNewProject }: Props): VNode {
               Pause
             </Button>
           )}
-          {status === 'paused' && (
+          {(status === 'paused' || status === 'blocked') && (
             <Button small variant="primary" busy={busy['session:resume']} onClick={() => void store.session('resume')}>
-              Resume
+              {status === 'paused' ? 'Resume' : 'Continue'}
             </Button>
           )}
-          {(status === 'running' || status === 'paused') && (
+          {(status === 'running' || status === 'paused' || status === 'blocked') && (
             <ConfirmButton small label="Stop" confirmLabel="Stop session?" busy={busy['session:stop']} onConfirm={() => void store.session('stop')} />
           )}
-          {(status === 'stopped' || status === 'completed') && (
+          {(status === 'stopped' || status === 'completed' || status === 'idle') && (
             <Button small variant="primary" busy={busy['session:start']} onClick={() => void store.session('start')}>
-              New session
+              {status === 'idle' ? 'Start' : status === 'stopped' ? 'Continue the work' : 'New session'}
             </Button>
           )}
         </div>

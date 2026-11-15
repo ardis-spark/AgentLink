@@ -126,8 +126,17 @@ export async function compactTranscript(
 
 const SOURCE_LABEL = {
   auto: 'read automatically from the Arena tab',
-  manual_capture: 'captured from the Arena tab at the user\'s request',
+  manual_capture: 'captured from the Arena tab by the user',
   pasted: 'pasted in by the user',
+} as const;
+
+const COMPLETION_LABEL = {
+  marker: 'Arena closed its report with the completion line it was asked for, so the reply is complete.',
+  quiet:
+    'Arena stopped working and the reply stopped changing, but it did NOT end with the completion line it was asked for. Arena may have stopped early or may be waiting for an answer; check the end of the reply.',
+  stalled:
+    'The Arena page still showed a working indicator, but the reply had not changed for a long time, so AgentLink collected what was there. The reply MAY BE INCOMPLETE.',
+  manual: 'The user supplied this reply; AgentLink did not observe Arena finishing.',
 } as const;
 
 /**
@@ -143,22 +152,53 @@ export function buildEvaluationPrompt(task: ArenaTask, settings: CompanionSettin
   const notes = [
     `Source: ${SOURCE_LABEL[response.source]}.`,
     `Length: ${response.chars.toLocaleString('en-US')} characters.`,
+    COMPLETION_LABEL[response.completion] ?? '',
     response.truncated ? 'AgentLink stored only the first part of a longer reply.' : '',
     shown.truncated ? 'The middle of the reply is omitted below to save context; the omission is marked.' : '',
-    task.dispatch?.unconfirmed ? 'AgentLink could not confirm that Arena received the task exactly as written.' : '',
   ].filter(Boolean);
   return [
     `[AgentLink] Arena has replied to task ${task.id} "${task.title}".`,
     notes.join(' '),
     `<<<ARENA_RESPONSE_BEGIN ${nonce}>>>\n${shown.text}\n<<<ARENA_RESPONSE_END ${nonce}>>>`,
-    `Evaluate this reply against the acceptance criteria of ${task.id} by calling evaluate_arena_result. Then update the project memory where needed, give the user your assessment in a few sentences, and propose a next task only if more work is required.`,
+    `Evaluate this reply against the acceptance criteria of ${task.id} by calling evaluate_arena_result. Then update the project memory where needed and, in this same turn, either send the next task with dispatch_arena_task, call mark_objective_complete if the whole objective is now demonstrated, or call request_user_input if there is a genuine blocker. Do not ask the user for approval. Close with a short note of what you found and what happens next.`,
   ].join('\n\n');
 }
 
-export function buildRejectionPrompt(task: ArenaTask, reason: string): string {
+/** The first turn of a session: the objective is all the coordinator gets. */
+export function buildKickoffPrompt(project: Project): string {
+  const resumed = project.tasks.length > 0 || project.milestones.length > 0;
   return [
-    `[AgentLink] The user rejected task ${task.id} "${task.title}" before it was sent to Arena.`,
-    `Reason given: "${reason}"`,
-    'Take this into account. Propose a revised task only if the reason makes the needed change clear; otherwise ask the user what they want instead.',
+    resumed
+      ? '[AgentLink] The session has been started again. PROJECT MEMORY shows where the work stands.'
+      : `[AgentLink] The user has set this objective and started the session:\n\n${project.objective}`,
+    resumed
+      ? 'Continue autonomously from the recorded state: send the next task with dispatch_arena_task, or call mark_objective_complete if the objective is already demonstrated.'
+      : 'Work autonomously from here. Set the plan with set_plan, then send the first task to Arena with dispatch_arena_task in this same turn. Do not ask the user to approve the plan or the task. Call request_user_input only if the objective cannot be started without information that only the user has.',
+  ].join('\n\n');
+}
+
+/** Sent when a coordinator turn ended with nothing left in motion. */
+export function buildContinuePrompt(project: Project, reason: 'idle' | 'failure' | 'resume'): string {
+  const lead =
+    reason === 'failure'
+      ? '[AgentLink] Your previous turn did not finish because the request to Gemini failed. It is being repeated.'
+      : reason === 'resume'
+        ? '[AgentLink] The session is running again.'
+        : '[AgentLink] Your last turn ended with no task on its way to Arena, the objective is not marked complete, and you did not call request_user_input. The project is standing still.';
+  const unfinished = project.milestones.filter((m) => m.status !== 'done');
+  const state = unfinished.length ? `Unfinished milestones: ${unfinished.map((m) => `${m.id} "${m.title}"`).join(', ')}.` : project.milestones.length ? 'Every milestone is marked done.' : 'No plan has been set yet.';
+  return [
+    lead,
+    state,
+    'Continue now: send the next task with dispatch_arena_task (set the plan first if there is none), or call mark_objective_complete if evaluated replies demonstrate the whole objective. If, and only if, you cannot continue without information or authorisation from the user, call request_user_input with one specific question.',
+  ].join('\n\n');
+}
+
+/** Arena received a task and never produced a reply. */
+export function buildNoResponsePrompt(task: ArenaTask, reason: string): string {
+  return [
+    `[AgentLink] Arena did not reply to task ${task.id} "${task.title}".`,
+    reason,
+    'The task is closed as "no reply"; nothing is known about whether any of its work happened. Decide what to do: you may send the same task again, send a smaller or differently worded one, or first send a task that asks Arena to report the current state. If Arena has now failed to answer repeatedly, call request_user_input and say so.',
   ].join('\n\n');
 }

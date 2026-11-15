@@ -54,3 +54,13 @@ export function cleanList(values: unknown, maxItems = 50, maxChars = 2000): stri
   }
   return out;
 }
+
+/** A short fingerprint of a text; it changes whenever the text does. Used to tell whether a reply is still moving. */
+export function digestOf(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
+}

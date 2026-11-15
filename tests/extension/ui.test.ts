@@ -3,12 +3,17 @@ import { build } from 'esbuild';
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { UiRequest, UiResult } from '../../src/shared/messages.js';
-import { errorBody, textResponse, toolResponse, VALID_KEY } from '../helpers/fakeGemini.js';
+import { errorBody, textResponse, toolResponse, VALID_KEY, type Scripted } from '../helpers/fakeGemini.js';
 import { createHarness, waitFor, type Harness } from '../helpers/harness.js';
 
 /**
  * Runs the real, bundled workspace UI in a DOM against a real companion.
  * Only the browser extension API, the background script and Gemini are stand-ins.
+ *
+ * The page is a window onto work that runs by itself. The tests therefore
+ * never "approve" or "send" anything: after the objective is given, what
+ * the relay would do is done directly on the companion, and the page has to
+ * show it.
  */
 
 let bundle = '';
@@ -18,7 +23,6 @@ let stored: Record<string, unknown>;
 let backgroundRequests: UiRequest[];
 let openedTabs: string[];
 let pageErrors: string[];
-let deliverDispatches: boolean;
 
 beforeAll(async () => {
   const result = await build({
@@ -54,11 +58,7 @@ function boot(search = ''): void {
       sendMessage: async (request: UiRequest): Promise<UiResult<unknown>> => {
         backgroundRequests.push(request);
         if (request.type === 'agentlink:ui:listArenaTabs') return { ok: true, value: [] };
-        if (request.type === 'agentlink:ui:dispatchTask' && deliverDispatches) {
-          // Stands in for the background script typing the task into Arena and seeing it accepted.
-          const claim = h.companion.orchestrator.claimDispatch(request.projectId, request.taskId, { tabId: 7, tabUrl: 'https://arena.ai/c/abc' });
-          h.companion.orchestrator.confirmDispatch(request.projectId, request.taskId, claim.dispatchId);
-        }
+        if (request.type === 'agentlink:ui:captureResponse') return { ok: true, value: { chars: 0 } };
         return { ok: true, value: null };
       },
     },
@@ -108,7 +108,34 @@ const shows = async (needle: string | RegExp, timeoutMs = 4_000): Promise<void> 
   }
 };
 
-async function pairAndCreateProject(): Promise<void> {
+const TASK_ARGS = {
+  title: 'Add the health endpoint',
+  instructions: 'Add GET /health returning {"ok":true}.',
+  context: 'Express app in src/server.ts.',
+  acceptance_criteria: ['`npm test` passes'],
+  rationale: 'Smallest verifiable step.',
+};
+/** Gemini's first turn: it sends a task to Arena straight away. */
+const sendsTask = (): Scripted[] => [toolResponse([{ name: 'dispatch_arena_task', args: TASK_ARGS }]), textResponse('I sent **T-1** to Arena and will review its report.')];
+const REPLY = 'Added GET /health in src/server.ts.\n$ npm test\n 12 passed, 0 failed\nAGENTLINK-DONE';
+
+const orchestrator = () => h.companion.orchestrator;
+const projectId = (): string => h.companion.store.list()[0]?.id ?? '';
+const buttons = (): string[] => Array.from(dom.window.document.querySelectorAll('button'), (b) => (b.textContent ?? '').trim());
+const alertText = (): string => dom.window.document.querySelector('[role="alert"]')?.textContent ?? '';
+
+/** What the relay does once the Arena tab is usable: it types the task in and sees it accepted. */
+function relayDelivers(): string {
+  orchestrator().relayWork();
+  const claim = orchestrator().claimDispatch(projectId(), 'T-1', { tabId: 7, tabUrl: 'https://arena.ai/c/abc' });
+  orchestrator().confirmDispatch(projectId(), 'T-1', claim.dispatchId);
+  orchestrator().reportRelay(projectId(), 'T-1', { dispatchId: claim.dispatchId, phase: 'submitted', message: 'Arena accepted the task. Waiting for it to start…', attention: false, chars: 0 });
+  return claim.dispatchId;
+}
+
+/** Pairs, fills in the project form and presses Start. That is the last thing the user has to do. */
+async function pairAndCreateProject(script: Scripted[] = sendsTask()): Promise<void> {
+  h.fake.enqueue(...script);
   boot();
   await shows('Companion not running');
   type('#companion-url', h.companion.server.address);
@@ -119,7 +146,7 @@ async function pairAndCreateProject(): Promise<void> {
   type('#project-objective', 'Expose a health endpoint');
   type('#project-constraints', 'Do not change the public API\n- Keep tests green');
   await submit('#project-name');
-  await shows('Describe what you want built.');
+  await shows('Expose a health endpoint');
 }
 
 beforeEach(async () => {
@@ -129,7 +156,6 @@ beforeEach(async () => {
   backgroundRequests = [];
   openedTabs = [];
   pageErrors = [];
-  deliverDispatches = false;
 });
 
 afterEach(async () => {
@@ -169,135 +195,175 @@ describe('workspace UI', () => {
     await shows('Start your first project');
   });
 
-  it('pairs, creates a project and shows live Gemini state', async () => {
+  it('pairs, takes the objective once, and the work starts with no further step', async () => {
     await pairAndCreateProject();
-    expect(text()).toContain('Expose a health endpoint');
-    expect(text()).toMatch(/Gemini/);
+    await shows('will review its report.');
+    await shows('Going to Arena');
+    expect(text()).toContain('Running by itself');
+    expect(text()).toContain('Add the health endpoint');
+    expect($('.prose strong').textContent).toBe('T-1');
+    // The objective was the project form; nobody had to type a message or approve anything.
+    expect(Array.from(dom.window.document.querySelectorAll('.entry__who'), (el) => el.textContent)).not.toContain('You');
+    expect(text()).not.toMatch(/approv|your decision/i);
+    expect(buttons().filter((label) => /approve|reject|send to arena|edit task/i.test(label))).toEqual([]);
+    expect(backgroundRequests.every((r) => r.type === 'agentlink:ui:listArenaTabs' || r.type === 'agentlink:ui:wake')).toBe(true);
+
     // The constraint list is cleaned up and kept with the project.
     const project = h.companion.store.list()[0];
     expect(project?.name).toBe('Billing service');
     expect(h.companion.store.get(project?.id ?? '')?.constraints).toEqual(['Do not change the public API', 'Keep tests green']);
+    expect(h.companion.store.get(project?.id ?? '')?.session.status).toBe('running');
     // Pairing survives a reload; the Gemini key never reaches extension storage or the page.
     expect(JSON.stringify(stored)).toContain(h.companion.token);
     expect(JSON.stringify(stored)).not.toContain(VALID_KEY);
     expect(dom.window.document.documentElement.outerHTML).not.toContain(VALID_KEY);
-  });
 
-  it('streams a coordinator turn, shows the proposed task and waits for approval', async () => {
-    await pairAndCreateProject();
-    h.fake.enqueue(
-      toolResponse([
-        {
-          name: 'propose_arena_task',
-          args: { title: 'Add the health endpoint', instructions: 'Add GET /health returning {"ok":true}.', context: 'Express app in src/server.ts.', acceptance_criteria: ['`npm test` passes'], rationale: 'Smallest verifiable step.' },
-        },
-      ]),
-      textResponse('I proposed **T-1**. Review it and approve when ready.'),
-    );
-    type('#composer-input', 'Add a health endpoint.');
-    await submit('#composer-input');
-
-    await shows('Approve and send to Arena');
-    await shows('Review it and approve when ready.');
-    expect(text()).toContain('Add the health endpoint');
-    expect(text()).toContain('Needs your approval');
-    expect(text()).toContain('T-1 is waiting for your decision');
-    expect($('.stage--waiting').textContent).toContain('Approve');
-    expect($('.prose strong').textContent).toBe('T-1');
-    // Nothing went to the background before the user decided.
-    expect(backgroundRequests.some((r) => r.type === 'agentlink:ui:dispatchTask')).toBe(false);
-
-    // The exact prompt is available for inspection, constraints included.
-    button(/Exact text that will be sent to Arena/).click();
+    // What Arena will be told can be read, constraints included.
+    button(/Text that will be sent to Arena/).click();
     await shows('Do not change the public API');
     expect($('pre.reply').textContent).toMatch(/^# Task T-1: Add the health endpoint/);
-
-    button('Approve and send to Arena').click();
-    await waitFor(() => backgroundRequests.some((r) => r.type === 'agentlink:ui:dispatchTask'), 'the dispatch request');
-    const dispatch = backgroundRequests.find((r) => r.type === 'agentlink:ui:dispatchTask');
-    expect(dispatch).toMatchObject({ taskId: 'T-1' });
-    await shows('Approved, not sent');
   });
 
-  it('lets the user edit a proposed task before approving and reject it with a reason', async () => {
+  it('shows the one thing that holds the work up, and nothing when it runs', async () => {
     await pairAndCreateProject();
-    h.fake.enqueue(
-      toolResponse([{ name: 'propose_arena_task', args: { title: 'Add endpoint', instructions: 'Add GET /health.', context: '', acceptance_criteria: ['It works'], rationale: 'First step.' } }]),
-      textResponse('Proposed.'),
-    );
-    type('#composer-input', 'Go.');
-    await submit('#composer-input');
-    await shows('Approve and send to Arena');
+    await shows('Going to Arena');
+    // No part of the extension has asked the companion for work yet.
+    await shows('The browser relay is not reaching the companion');
+    orchestrator().relayWork();
+    await waitFor(() => !text().includes('The browser relay is not reaching the companion'), 'the relay warning to clear');
+    expect(dom.window.document.querySelector('[role="alert"]')).toBeNull();
 
-    button('Edit').click();
-    await waitFor(() => dom.window.document.querySelector('#task-criteria') !== null, 'the task editor');
-    type('#task-title', 'Add the health endpoint with a test');
-    type('#task-criteria', '`npm test` passes\nGET /health returns 200');
-    await submit('#task-title');
-    await shows('Add the health endpoint with a test');
-    await shows('edited by you');
-    expect(text()).toContain('GET /health returns 200');
+    // The relay cannot deliver: there is no Arena tab.
+    orchestrator().reportRelay(projectId(), 'T-1', { dispatchId: null, phase: 'waiting_for_arena', message: 'No Arena tab is open. Open Arena Agent Mode in a tab; AgentLink sends the task as soon as it is there.', attention: true, chars: 0 });
+    await shows('T-1 is waiting on the Arena tab');
+    expect(alertText()).toContain('AgentLink sends the task as soon as it is there.');
+    expect(text()).toContain('Waiting for Arena');
+    expect($('.stage--problem').textContent).toContain('Send');
+    button('Arena settings');
+    button('Go to Arena tab').click();
+    await waitFor(() => backgroundRequests.some((r) => r.type === 'agentlink:ui:focusArenaTab'), 'the request to show the Arena tab');
 
-    h.fake.enqueue(textResponse('Understood. I will propose something smaller.'));
-    button('Reject').click();
-    await waitFor(() => dom.window.document.querySelector('#reject-reason') !== null, 'the reason field');
-    type('#reject-reason', 'Too broad');
-    await submit('#reject-reason');
-    await shows('Rejected by you');
-    await shows('I will propose something smaller.');
-    const project = h.companion.store.list()[0];
-    expect(h.companion.store.get(project?.id ?? '')?.tasks[0]?.rejection?.reason).toBe('Too broad');
-  });
-
-  it('carries a task through Arena and shows the review with its quoted evidence', async () => {
-    deliverDispatches = true;
-    await pairAndCreateProject();
-    h.fake.enqueue(
-      toolResponse([{ name: 'propose_arena_task', args: { title: 'Add endpoint', instructions: 'Add GET /health.', context: '', acceptance_criteria: ['`npm test` passes'], rationale: 'First step.' } }]),
-      textResponse('Proposed.'),
-    );
-    type('#composer-input', 'Go.');
-    await submit('#composer-input');
-    await shows('Approve and send to Arena');
-    button('Approve and send to Arena').click();
-
-    await shows('Capture reply now');
-    expect(text()).toContain('Arena is working on T-1');
+    // The tab is opened; the relay delivers by itself and the warning goes away.
+    relayDelivers();
+    await shows('Arena is working');
+    await waitFor(() => dom.window.document.querySelector('[role="alert"]') === null, 'the warning to clear');
     expect($('.stage--active').textContent).toContain('Execute');
+    expect(text()).toContain('Arena accepted the task.');
+    expect(text()).toContain('arena.ai');
+  });
 
-    // Arena's reply comes back by hand; Gemini reviews it and must quote it.
-    const reply = 'Added GET /health in src/server.ts.\n$ npm test\n 12 passed, 0 failed';
+  it('follows a task through Arena and the review, then hands a question to the user and goes on with the answer', async () => {
+    await pairAndCreateProject();
+    await shows('Going to Arena');
+    const dispatchId = relayDelivers();
+    await shows('Arena is working');
+    orchestrator().reportRelay(projectId(), 'T-1', { dispatchId, phase: 'generating', message: 'Arena is working…', attention: false, chars: 1234 });
+    await shows(/1[,.\s]?234 characters so far/);
+
+    // The relay brings the reply back; Gemini reviews it, must quote it, and then needs a decision.
     h.fake.enqueue(
       toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-1', verdict: 'complete', summary: 'The endpoint exists and the suite passes.', evidence: ['12 passed, 0 failed'], missing: [] } }]),
-      textResponse('T-1 is verified. Next I will propose the readiness check.'),
+      toolResponse([{ name: 'request_user_input', args: { question: 'Should the endpoint also report the build version?', why: 'It changes the response format.', options: ['Yes, add the version', 'No, keep it minimal'] } }]),
+      textResponse('T-1 is verified. One decision is yours before I continue.'),
     );
-    button('Paste reply…').click();
-    await waitFor(() => dom.window.document.querySelector('#paste-reply') !== null, 'the paste field');
-    type('#paste-reply', reply);
-    await submit('#paste-reply');
+    orchestrator().recordArenaResponse(projectId(), 'T-1', { dispatchId, text: REPLY, source: 'auto', completion: 'marker' });
 
     await shows('Verified complete');
-    await shows('Next I will propose the readiness check.');
+    await shows('One decision is yours before I continue.');
     expect($('.verdict').textContent).toContain('The endpoint exists and the suite passes.');
     expect($('.quotes').textContent).toContain('12 passed, 0 failed');
-    expect(text()).toContain('pasted by you');
-    expect(text()).toContain('No task in progress');
+    expect(text()).toContain('read from the Arena tab');
+    await shows('Waiting for your answer');
+    expect(alertText()).toContain('Should the endpoint also report the build version?');
+    // An open question needs an answer, not "Continue".
+    expect(Array.from(dom.window.document.querySelectorAll('[role="alert"] button'), (b) => (b.textContent ?? '').trim())).toEqual(['Yes, add the version', 'No, keep it minimal']);
+    expect($<HTMLTextAreaElement>('#composer-input').placeholder).toBe('Your answer');
 
-    // The record is in the activity log and survives a reload of the page.
+    // One click answers, and the work goes on to its end.
+    h.fake.enqueue(toolResponse([{ name: 'mark_objective_complete', args: { summary: 'GET /health is built and tested.' } }]), textResponse('Kept it minimal. The objective is met.'));
+    button('No, keep it minimal').click();
+    await shows('Objective complete');
+    await shows('The objective is met.');
+    expect(dom.window.document.querySelector('[role="alert"]')).toBeNull();
+    expect(h.fake.pending).toBe(0);
+
+    // The record survives a reload of the page.
     dom.window.close();
     boot();
     await shows('Verified complete');
     expect(text()).toContain('T-1 is verified.');
+    expect(text()).toContain('Objective complete');
   });
 
-  it('shows a Gemini failure in the conversation and keeps the composer usable', async () => {
+  it('pauses, resumes and stops the session from the top bar', async () => {
     await pairAndCreateProject();
-    h.fake.enqueue({ kind: 'error', status: 403, body: errorBody(403, 'PERMISSION_DENIED', 'The caller does not have permission') });
-    type('#composer-input', 'Hello');
-    await submit('#composer-input');
-    await waitFor(() => dom.window.document.querySelector('.entry__flag--bad') !== null, 'the failed turn');
+    await shows('Going to Arena');
+    orchestrator().relayWork();
+
+    button('Pause').click();
+    await shows('Paused');
+    await shows('This task is sent when you resume.');
+    expect((await h.companion.orchestrator.relayWork()).items).toEqual([]);
+    expect($<HTMLTextAreaElement>('#composer-input').disabled).toBe(true);
+    expect(text()).toContain('Session paused. Resume it to continue.');
+
+    button('Resume').click();
+    await shows('Running by itself');
+    expect(orchestrator().relayWork().items).toHaveLength(1);
     expect($<HTMLTextAreaElement>('#composer-input').disabled).toBe(false);
-    expect($('.entry__flag--bad').textContent?.length).toBeGreaterThan(10);
+
+    // Stopping asks once more, then cancels the open task.
+    button('Stop').click();
+    await waitFor(() => buttons().includes('Stop session?'), 'the confirmation');
+    button('Stop session?').click();
+    await shows('Stopped');
+    await shows('Cancelled');
+    expect(h.companion.store.get(projectId())?.tasks[0]?.status).toBe('cancelled');
+    expect(orchestrator().relayWork().items).toEqual([]);
+    button('Continue the work');
+  });
+
+  it('explains a Gemini failure where the user will see it, and continues on request', async () => {
+    await pairAndCreateProject([{ kind: 'error', status: 403, body: errorBody(403, 'PERMISSION_DENIED', 'The caller does not have permission') }]);
+    await shows('Needs you');
+    await waitFor(() => alertText().length > 0, 'the explanation');
+    expect(alertText()).toMatch(/Gemini/);
+    expect(alertText()).toMatch(/permission/i);
+    button('Gemini settings');
+    expect($<HTMLTextAreaElement>('#composer-input').disabled).toBe(false);
+    expect(h.companion.store.get(projectId())?.session.blocker?.kind).toBe('gemini');
+
+    h.fake.enqueue(...sendsTask());
+    Array.from(dom.window.document.querySelectorAll<HTMLButtonElement>('[role="alert"] button')).find((b) => (b.textContent ?? '').trim() === 'Continue')?.click();
+    await shows('Going to Arena');
+    await shows('Running by itself');
+    expect(dom.window.document.querySelector('[role="alert"]')?.textContent ?? '').not.toMatch(/permission/i);
+  });
+
+  it('offers recovery by hand for a reply AgentLink cannot read, without making it part of the flow', async () => {
+    await pairAndCreateProject();
+    await shows('Going to Arena');
+    relayDelivers();
+    await shows('AgentLink collects the reply by itself when Arena has finished.');
+
+    button('Take the reply as it is now').click();
+    await waitFor(() => backgroundRequests.some((r) => r.type === 'agentlink:ui:captureResponse'), 'the capture request');
+    expect(backgroundRequests.find((r) => r.type === 'agentlink:ui:captureResponse')).toMatchObject({ projectId: projectId(), taskId: 'T-1' });
+
+    h.fake.enqueue(
+      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-1', verdict: 'partial', summary: 'The endpoint exists; the test run is not shown.', evidence: ['Added GET /health in src/server.ts.'], missing: ['`npm test` passes'] } }]),
+      toolResponse([{ name: 'request_user_input', args: { question: 'The test run is missing. Ask Arena to run the tests?', why: 'The criterion is not shown.', options: [] } }]),
+      textResponse('T-1 is only partly shown.'),
+    );
+    button('Paste the reply by hand…').click();
+    await waitFor(() => dom.window.document.querySelector('#paste-reply') !== null, 'the paste field');
+    type('#paste-reply', 'Added GET /health in src/server.ts.');
+    await submit('#paste-reply');
+
+    await shows('Partly done');
+    await shows('pasted by you');
+    expect($('.verdict').textContent).toContain('the test run is not shown');
+    expect(text()).toContain('`npm test` passes');
   });
 
   it('opens the companion page for the API key instead of asking for it', async () => {

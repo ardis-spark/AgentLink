@@ -1,14 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
-import type { CompanionEvent, CreateProjectRequest, EditTaskRequest, SessionAction, UpdateProjectRequest } from '../../shared/api.js';
-import type {
-  ArenaAdapterConfig,
-  ArenaConnectionTest,
-  ArenaExecutionStatus,
-  ArenaTabInfo,
-  ExecutionStatusBroadcast,
-  ManualSendResult,
-} from '../../shared/messages.js';
-import type { ArenaTask, CompanionSettings, ConversationEntry, GeminiModelInfo, GeminiStatus, ProjectSummary, ProjectView, TurnState } from '../../shared/types.js';
+import type { CompanionEvent, CreateProjectRequest, SessionAction, UpdateProjectRequest } from '../../shared/api.js';
+import type { ArenaAdapterConfig, ArenaConnectionTest, ArenaTabInfo } from '../../shared/messages.js';
+import type { ArenaTask, CompanionSettings, ConversationEntry, GeminiModelInfo, GeminiStatus, ProjectSummary, ProjectView, RelayLink, TurnState } from '../../shared/types.js';
 import { CompanionClient, CompanionError } from '../lib/companionClient.js';
 import { DEFAULT_EXTENSION_SETTINGS, loadSettings, normalizeCompanionUrl, onSettingsChanged, saveSettings, type ExtensionSettings } from '../lib/settings.js';
 import { askBackground } from './background.js';
@@ -37,8 +30,8 @@ export interface WorkspaceState {
   project: ProjectView | null;
   conversation: ConversationEntry[];
   turn: TurnState | null;
-  /** Arena execution status per task id, for the open project. */
-  executions: Record<string, ArenaExecutionStatus>;
+  /** Whether the background relay that carries tasks to Arena is in contact with the companion. */
+  relay: RelayLink | null;
   arenaTabs: ArenaTabInfo[] | null;
   arenaError: string | null;
   arenaTest: ArenaConnectionTest | null;
@@ -63,7 +56,7 @@ const initialState: WorkspaceState = {
   project: null,
   conversation: [],
   turn: null,
-  executions: {},
+  relay: null,
   arenaTabs: null,
   arenaError: null,
   arenaTest: null,
@@ -83,7 +76,6 @@ class WorkspaceStore {
   private closeStream: (() => void) | null = null;
   private noticeSeq = 0;
   private noticeTimer: number | null = null;
-  private readonly resumedWatches = new Set<string>();
   private started = false;
 
   subscribe = (listener: () => void): (() => void) => {
@@ -131,11 +123,6 @@ class WorkspaceStore {
       const changed = ext.companionUrl !== this.state.ext.companionUrl || ext.pairingToken !== this.state.ext.pairingToken;
       this.set({ ext });
       if (changed) void this.connect();
-    });
-    browser.runtime.onMessage.addListener((raw: unknown) => {
-      const broadcast = raw as ExecutionStatusBroadcast | null;
-      if (broadcast?.type === 'agentlink:bg:execution') this.onExecution(broadcast.status);
-      return undefined;
     });
     await this.connect();
     void this.refreshArena();
@@ -192,6 +179,7 @@ class WorkspaceStore {
       version: status.version,
       gemini: status.gemini,
       settings: status.settings,
+      relay: status.relay ?? null,
       projects: list.projects,
       activeProjectId: list.activeProjectId,
       projectsLoaded: true,
@@ -200,12 +188,8 @@ class WorkspaceStore {
     const target = wanted && list.projects.some((p) => p.id === wanted) ? wanted : (list.projects[0]?.id ?? null);
     if (target) await this.loadProject(target);
     else this.set({ project: null, conversation: [], turn: null });
-    try {
-      const statuses = await askBackground<ArenaExecutionStatus[]>({ type: 'agentlink:ui:getExecutionStatus' });
-      for (const status of statuses) this.onExecution(status);
-    } catch {
-      // The Arena side is reported separately in the Arena panel.
-    }
+    // The relay runs by itself in the background; this only spares the wait until its next look.
+    void askBackground({ type: 'agentlink:ui:wake' }).catch(() => undefined);
   }
 
   private async loadProject(id: string): Promise<void> {
@@ -215,20 +199,8 @@ class WorkspaceStore {
       project: view.project,
       conversation: view.conversation,
       turn: view.turn,
-      executions: switched ? {} : this.state.executions,
       fullTasks: switched ? {} : this.state.fullTasks,
     });
-    this.resumeWatching(view.project);
-  }
-
-  /** After a browser restart nobody is watching Arena for a task that is still waiting; pick that up again once. */
-  private resumeWatching(project: ProjectView): void {
-    const waiting = project.tasks.find((t) => t.status === 'awaiting_response');
-    if (!waiting || !waiting.dispatch) return;
-    const id = `${project.id}/${waiting.id}/${waiting.dispatch.dispatchId}`;
-    if (this.resumedWatches.has(id) || this.state.executions[waiting.id]) return;
-    this.resumedWatches.add(id);
-    void askBackground({ type: 'agentlink:ui:resumeWatch', projectId: project.id, taskId: waiting.id }).catch(() => undefined);
   }
 
   private onEvent(event: CompanionEvent): void {
@@ -254,10 +226,10 @@ class WorkspaceStore {
         }
         break;
       case 'project':
-        if (event.projectId === current) {
-          this.set({ project: event.project });
-          this.resumeWatching(event.project);
-        }
+        if (event.projectId === current) this.set({ project: event.project });
+        break;
+      case 'relay':
+        this.set({ relay: event.relay });
         break;
       case 'entry': {
         if (event.projectId !== current) break;
@@ -275,14 +247,6 @@ class WorkspaceStore {
         if (event.projectId === current) this.set({ turn: event.turn });
         break;
     }
-  }
-
-  private onExecution(status: ArenaExecutionStatus): void {
-    if (status.projectId !== this.state.project?.id) return;
-    const executions = { ...this.state.executions };
-    if (status.phase === 'idle') delete executions[status.taskId];
-    else executions[status.taskId] = status;
-    this.set({ executions });
   }
 
   // -------------------------------------------------------------- pairing ---
@@ -344,14 +308,14 @@ class WorkspaceStore {
   selectProject = (id: string): Promise<void> =>
     this.run('project:select', async () => {
       const view = await this.client.activateProject(id);
-      this.set({ project: view.project, conversation: view.conversation, turn: view.turn, executions: {}, fullTasks: {}, activeProjectId: id });
-      this.resumeWatching(view.project);
+      this.set({ project: view.project, conversation: view.conversation, turn: view.turn, fullTasks: {}, activeProjectId: id });
     }).then(() => undefined);
 
   async createProject(input: CreateProjectRequest): Promise<boolean> {
     const created = await this.run('project:create', async () => {
       const view = await this.client.createProject(input);
-      this.set({ project: view.project, conversation: view.conversation, turn: view.turn, executions: {}, fullTasks: {}, activeProjectId: view.project.id });
+      this.set({ project: view.project, conversation: view.conversation, turn: view.turn, fullTasks: {}, activeProjectId: view.project.id });
+      void askBackground({ type: 'agentlink:ui:wake' }).catch(() => undefined);
       return true;
     });
     return created === true;
@@ -373,7 +337,7 @@ class WorkspaceStore {
       const project = this.state.project;
       if (!project) return;
       await this.client.deleteProject(project.id);
-      this.set({ project: null, conversation: [], turn: null, executions: {} });
+      this.set({ project: null, conversation: [], turn: null });
       await this.loadEverything();
     }).then(() => undefined);
 
@@ -398,11 +362,9 @@ class WorkspaceStore {
     this.run(`session:${action}`, async () => {
       const project = this.state.project;
       if (!project) return;
-      const open = project.tasks.find((t) => t.id === project.currentTaskId);
       const view = await this.client.controlSession(project.id, action);
       this.set({ project: view.project, conversation: view.conversation, turn: view.turn });
-      // Stopping cancels the open task, so nothing should keep watching Arena for it.
-      if (action === 'stop' && open) void askBackground({ type: 'agentlink:ui:cancelExecution', projectId: project.id, taskId: open.id }).catch(() => undefined);
+      void askBackground({ type: 'agentlink:ui:wake' }).catch(() => undefined);
     }).then(() => undefined);
 
   // ----------------------------------------------------------------- tasks ---
@@ -417,53 +379,20 @@ class WorkspaceStore {
     return done === true;
   }
 
-  /** Approving is the user's go-ahead: the task is approved and then sent to the selected Arena tab. */
-  approveAndSend = (taskId: string): Promise<boolean> =>
-    this.taskAction('send', taskId, async (projectId) => {
-      const task = this.state.project?.tasks.find((t) => t.id === taskId);
-      if (task?.status === 'proposed') await this.client.approveTask(projectId, taskId);
-      await askBackground({ type: 'agentlink:ui:dispatchTask', projectId, taskId });
-    });
+  /** The user abandons the open task. The coordinator is told and chooses another next step. */
+  cancelTask = (taskId: string): Promise<boolean> => this.taskAction('cancel', taskId, (projectId) => this.client.cancelTask(projectId, taskId));
 
-  /** Records the task as sent and copies its exact text, for pasting into Arena by hand. */
-  sendManually = (taskId: string): Promise<boolean> =>
-    this.taskAction('send', taskId, async (projectId) => {
-      const task = this.state.project?.tasks.find((t) => t.id === taskId);
-      if (task?.status === 'proposed') await this.client.approveTask(projectId, taskId);
-      const result = await askBackground<ManualSendResult>({ type: 'agentlink:ui:manualSend', projectId, taskId });
-      try {
-        await navigator.clipboard.writeText(result.prompt);
-        this.notify('ok', 'Task copied. Paste it into Arena and send it.');
-      } catch {
-        this.notify('warn', 'The task is marked as sent, but it could not be copied automatically. Use "Copy task text" on the task card.');
-      }
-    });
+  // Recovery tools. The relay collects Arena's replies by itself; these exist for the case where the Arena
+  // page cannot be read at all, and are never needed in normal operation.
 
-  editTask = (taskId: string, patch: EditTaskRequest): Promise<boolean> => this.taskAction('edit', taskId, (projectId) => this.client.editTask(projectId, taskId, patch));
-
-  rejectTask = (taskId: string, reason: string): Promise<boolean> => this.taskAction('reject', taskId, (projectId) => this.client.rejectTask(projectId, taskId, reason));
-
-  cancelTask = (taskId: string): Promise<boolean> =>
-    this.taskAction('cancel', taskId, async (projectId) => {
-      await this.client.cancelTask(projectId, taskId);
-      await askBackground({ type: 'agentlink:ui:cancelExecution', projectId, taskId }).catch(() => undefined);
-    });
-
+  /** Hands over what Arena has written for the task right now, without waiting for it to settle. */
   captureReply = (taskId: string): Promise<boolean> => this.taskAction('capture', taskId, (projectId) => askBackground({ type: 'agentlink:ui:captureResponse', projectId, taskId }));
 
+  /** Supplies Arena's reply by hand. */
   pasteReply = (taskId: string, text: string): Promise<boolean> =>
     this.taskAction('paste', taskId, async (projectId) => {
       const task = this.state.project?.tasks.find((t) => t.id === taskId);
-      await this.client.recordArenaResponse(projectId, taskId, { dispatchId: task?.dispatch?.dispatchId ?? null, text, source: 'pasted' });
-      await askBackground({ type: 'agentlink:ui:cancelExecution', projectId, taskId }).catch(() => undefined);
-    });
-
-  retryEvaluation = (taskId: string): Promise<boolean> => this.taskAction('evaluate', taskId, (projectId) => this.client.retryEvaluation(projectId, taskId));
-
-  markNotSent = (taskId: string): Promise<boolean> =>
-    this.taskAction('reset', taskId, async (projectId) => {
-      await this.client.resetDispatch(projectId, taskId);
-      await askBackground({ type: 'agentlink:ui:cancelExecution', projectId, taskId }).catch(() => undefined);
+      await this.client.recordArenaResponse(projectId, taskId, { dispatchId: task?.dispatch?.dispatchId ?? null, text, source: 'pasted', completion: 'manual' });
     });
 
   loadFullTask = (taskId: string): Promise<void> =>

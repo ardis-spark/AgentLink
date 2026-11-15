@@ -263,77 +263,135 @@ describe('the workflow over HTTP and the event stream', () => {
     return { events, close: () => controller.abort() };
   }
 
-  it('runs propose → approve → claim → confirm → reply → evaluate through the API', async () => {
-    const created = await call('/v1/projects', { body: { name: 'HTTP flow', objective: 'Prove the API works', constraints: ['No secrets in code'] } });
-    expect(created.status).toBe(200);
-    const id = created.json.project.id as string;
-    expect(id).toMatch(/^p_[0-9a-f]{12}$/);
-    const stream = await openEvents(id);
+  const README_TASK = { title: 'Add a README', instructions: 'Write a README with install and test steps.', context: 'Empty repo.', acceptance_criteria: ['README.md exists'], rationale: 'First step.' };
+
+  it('runs objective → task → claim → confirm → reply → review → complete through the API, with no approval step', async () => {
+    const stream = await openEvents();
     expect(stream.events[0]).toEqual({ type: 'hello', version: 'test' });
     expect(stream.events[1]).toMatchObject({ type: 'gemini' });
     expect(JSON.stringify(stream.events)).not.toContain(VALID_KEY);
 
-    h.fake.enqueue(
-      toolResponse([{ name: 'propose_arena_task', args: { title: 'Add a README', instructions: 'Write a README with install steps.', context: 'Empty repo.', acceptance_criteria: ['README.md exists'], rationale: 'First step.' } }]),
-      textResponse('Proposed a first task for your approval.', { pieces: 3 }),
-    );
-    const sent = await call(`/v1/projects/${id}/messages`, { body: { text: 'Please start.' } });
-    expect(sent.status).toBe(202);
-    expect(sent.json.entry).toMatchObject({ role: 'user', text: 'Please start.' });
+    // Nothing for the extension to do yet; asking is what marks it as in contact.
+    expect((await call('/v1/status')).json.relay).toMatchObject({ online: false, seenAt: null });
+    expect((await call('/v1/relay/work')).json).toEqual({ items: [] });
+    expect((await call('/v1/status')).json.relay.online).toBe(true);
+
+    // Creating the project with the objective is the only thing the user does.
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: README_TASK }]), textResponse('The first task is on its way to Arena.', { pieces: 3 }));
+    const created = await call('/v1/projects', { body: { name: 'HTTP flow', objective: 'Prove the API works', constraints: ['No secrets in code'], start: true } });
+    expect(created.status).toBe(200);
+    const id = created.json.project.id as string;
+    expect(id).toMatch(/^p_[0-9a-f]{12}$/);
+    expect(created.json.project.session.status).toBe('running');
     await h.companion.orchestrator.whenIdle(id);
-    await waitFor(() => stream.events.some((e) => e.type === 'turn' && !e.turn.active && e.turn.phase === 'idle'), 'the turn to finish on the stream');
+    await waitFor(() => stream.events.some((e) => e.type === 'project' && e.project.tasks[0]?.status === 'queued'), 'the queued task on the stream');
+    const scoped = await openEvents(id);
 
-    const deltas = stream.events.filter((e) => e.type === 'delta').map((e) => (e.type === 'delta' ? e.text : ''));
-    expect(deltas.join('')).toBe('Proposed a first task for your approval.');
-    expect(stream.events.some((e) => e.type === 'project' && e.project.tasks[0]?.status === 'proposed')).toBe(true);
-
-    // Nothing can be claimed before approval.
-    const early = await call(`/v1/projects/${id}/tasks/T-1/dispatch/claim`, { body: {} });
-    expect([early.status, early.json.error.code]).toEqual([409, 'not_dispatchable']);
-
-    const edited = await call(`/v1/projects/${id}/tasks/T-1`, { method: 'PATCH', body: { instructions: 'Write a README with install and test steps.' } });
-    expect(edited.json.task.editedByUser).toBe(true);
-    expect((await call(`/v1/projects/${id}/tasks/T-1/approve`, { method: 'POST', body: {} })).json.task.status).toBe('approved');
+    // The extension finds the task, reports progress, and delivers it.
+    const work = await call('/v1/relay/work');
+    expect(work.json.items).toHaveLength(1);
+    expect(work.json.items[0]).toMatchObject({ projectId: id, projectName: 'HTTP flow', task: { id: 'T-1', status: 'queued' } });
+    const waiting = await call(`/v1/projects/${id}/tasks/T-1/relay`, { body: { phase: 'waiting_for_arena', message: 'No Arena tab is open.', attention: true, chars: 0 } });
+    expect(waiting.status).toBe(204);
+    expect((await call(`/v1/projects/${id}/tasks/T-1`)).json.task.relay).toMatchObject({ phase: 'waiting_for_arena', attention: true });
 
     const claim = await call(`/v1/projects/${id}/tasks/T-1/dispatch/claim`, { body: { tabId: 12, tabUrl: 'https://arena.ai/c/1' } });
     expect(claim.status).toBe(200);
     expect(claim.json.prompt).toContain('Write a README with install and test steps.');
     expect(claim.json.prompt).toContain('No secrets in code');
+    expect(claim.json.prompt).toContain(claim.json.task.dispatch.ref);
     const again = await call(`/v1/projects/${id}/tasks/T-1/dispatch/claim`, { body: {} });
     expect([again.status, again.json.error.code]).toEqual([409, 'not_dispatchable']);
 
     const confirmed = await call(`/v1/projects/${id}/tasks/T-1/dispatch/confirm`, { body: { dispatchId: claim.json.dispatchId } });
     expect(confirmed.json.task.status).toBe('awaiting_response');
+    expect((await call('/v1/relay/work')).json.items[0].task.status).toBe('awaiting_response');
 
     h.fake.enqueue(
       toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-1', verdict: 'complete', summary: 'README written.', evidence: ['Created README.md with install and test sections'] } }]),
-      textResponse('T-1 is verified.'),
+      toolResponse([{ name: 'mark_objective_complete', args: { summary: 'The README exists.' } }]),
+      textResponse('T-1 is verified and the objective is met.', { pieces: 3 }),
     );
-    const reply = await call(`/v1/projects/${id}/tasks/T-1/arena-response`, { body: { dispatchId: claim.json.dispatchId, text: 'Created README.md with install and test sections.', source: 'auto' } });
+    const reply = await call(`/v1/projects/${id}/tasks/T-1/arena-response`, {
+      body: { dispatchId: claim.json.dispatchId, text: 'Created README.md with install and test sections.', source: 'auto', completion: 'marker' },
+    });
     expect(reply.json.task.status).toBe('evaluating');
     const duplicate = await call(`/v1/projects/${id}/tasks/T-1/arena-response`, { body: { dispatchId: claim.json.dispatchId, text: 'Created README.md with install and test sections.', source: 'auto' } });
     expect([duplicate.status, duplicate.json.error.code]).toEqual([409, 'response_already_recorded']);
     await h.companion.orchestrator.whenIdle(id);
+    // The stream is delivered asynchronously: wait until the end of the turn has arrived on it.
+    await waitFor(() => scoped.events.some((e) => e.type === 'turn' && !e.turn.active && e.turn.phase === 'idle'), 'the end of the turn on the stream');
+    const deltas = scoped.events.filter((e) => e.type === 'delta').map((e) => (e.type === 'delta' ? e.text : ''));
+    expect(deltas.length).toBeGreaterThan(1);
+    expect(deltas.join('')).toBe('T-1 is verified and the objective is met.');
+    expect(scoped.events.some((e) => e.type === 'project' && e.project.session.status === 'completed')).toBe(true);
+    scoped.close();
 
     const view = await call(`/v1/projects/${id}`);
-    expect(view.json.project.tasks[0]).toMatchObject({ status: 'completed', evaluation: { verdict: 'complete' } });
+    expect(view.json.project.tasks[0]).toMatchObject({ status: 'completed', evaluation: { verdict: 'complete' }, arenaResponse: { completion: 'marker' } });
+    expect(view.json.project.session.status).toBe('completed');
+    expect(view.json.project.status).toBe('complete');
     expect(view.json.project.transcript).toBeUndefined();
-    expect(view.json.conversation.at(-1).text).toBe('T-1 is verified.');
+    expect(view.json.conversation.at(-1).text).toBe('T-1 is verified and the objective is met.');
+    expect(view.json.conversation.some((e: { role: string }) => e.role === 'user')).toBe(false);
     expect(view.json.turn).toMatchObject({ active: false });
+    expect((await call('/v1/relay/work')).json).toEqual({ items: [] });
     stream.close();
   });
 
+  it('has no approval, rejection or task-editing endpoints any more', async () => {
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: README_TASK }]), textResponse('Sent.'));
+    const id = (await call('/v1/projects', { body: { name: 'No gates', objective: 'Run by itself', start: true } })).json.project.id as string;
+    await h.companion.orchestrator.whenIdle(id);
+    for (const [method, path] of [
+      ['POST', `/v1/projects/${id}/tasks/T-1/approve`],
+      ['POST', `/v1/projects/${id}/tasks/T-1/reject`],
+      ['POST', `/v1/projects/${id}/tasks/T-1/evaluate`],
+      ['PATCH', `/v1/projects/${id}/tasks/T-1`],
+    ] as const) {
+      const response = await call(path, { method, body: {} });
+      expect([method, path, [404, 405].includes(response.status)]).toEqual([method, path, true]);
+    }
+    expect((await call(`/v1/projects/${id}/tasks/T-1`)).json.task.status).toBe('queued');
+  });
+
+  it('carries the delivery-recovery and no-reply reports of the extension', async () => {
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: README_TASK }]), textResponse('Sent.'));
+    const id = (await call('/v1/projects', { body: { name: 'Recovery', objective: 'Recover', start: true } })).json.project.id as string;
+    await h.companion.orchestrator.whenIdle(id);
+    const base = `/v1/projects/${id}/tasks/T-1`;
+
+    const first = await call(`${base}/dispatch/claim`, { body: {} });
+    const failed = await call(`${base}/dispatch/fail`, { body: { dispatchId: first.json.dispatchId, error: 'No acknowledgement from Arena.', submitted: 'unknown' } });
+    expect(failed.json.task).toMatchObject({ status: 'awaiting_response', dispatch: { unconfirmed: true } });
+    const stale = await call(`${base}/dispatch/reset`, { body: { dispatchId: 'nope', reason: 'x' } });
+    expect([stale.status, stale.json.error.code]).toEqual([409, 'stale_dispatch']);
+    const reset = await call(`${base}/dispatch/reset`, { body: { dispatchId: first.json.dispatchId, reason: 'The task is not in the Arena conversation.' } });
+    expect(reset.json.task.status).toBe('queued');
+
+    const second = await call(`${base}/dispatch/claim`, { body: {} });
+    await call(`${base}/dispatch/confirm`, { body: { dispatchId: second.json.dispatchId } });
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: { ...README_TASK, title: 'Add a README (second try)' } }]), textResponse('Trying again.'));
+    const silent = await call(`${base}/no-response`, { body: { dispatchId: second.json.dispatchId, reason: 'Arena wrote nothing for 5 minutes.' } });
+    expect(silent.json.task).toMatchObject({ status: 'no_response', evaluation: null });
+    await h.companion.orchestrator.whenIdle(id);
+    expect((await call(`/v1/projects/${id}`)).json.project.tasks.map((t: { status: string }) => t.status)).toEqual(['no_response', 'queued']);
+  });
+
   it('exposes pause, resume and stop, and enforces them', async () => {
-    const id = (await call('/v1/projects', { body: { name: 'Controls', objective: 'Test controls' } })).json.project.id as string;
-    h.fake.enqueue(textResponse('ok'));
-    await call(`/v1/projects/${id}/messages`, { body: { text: 'hello' } });
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: README_TASK }]), textResponse('Sent.'));
+    const id = (await call('/v1/projects', { body: { name: 'Controls', objective: 'Test controls', start: true } })).json.project.id as string;
     await h.companion.orchestrator.whenIdle(id);
 
     const paused = await call(`/v1/projects/${id}/session`, { body: { action: 'pause' } });
     expect(paused.json.project.session.status).toBe('paused');
     const blocked = await call(`/v1/projects/${id}/messages`, { body: { text: 'still there?' } });
     expect([blocked.status, blocked.json.error.code]).toEqual([409, 'session_not_running']);
+    const claim = await call(`/v1/projects/${id}/tasks/T-1/dispatch/claim`, { body: {} });
+    expect([claim.status, claim.json.error.code]).toEqual([409, 'session_not_running']);
+    expect((await call('/v1/relay/work')).json.items).toEqual([]);
     expect((await call(`/v1/projects/${id}/session`, { body: { action: 'resume' } })).json.project.session.status).toBe('running');
+    expect((await call('/v1/relay/work')).json.items).toHaveLength(1);
     expect((await call(`/v1/projects/${id}/session`, { body: { action: 'stop' } })).json.project.session.status).toBe('stopped');
     const bad = await call(`/v1/projects/${id}/session`, { body: { action: 'explode' } });
     expect(bad.status).toBe(400);

@@ -18,9 +18,9 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   idleTimeoutMs: 120_000,
   totalTimeoutMs: 20 * 60_000,
   maxToolRounds: 6,
-  maxTasksPerSession: 20,
+  maxTasksPerSession: 100,
   contextBudgetChars: 400_000,
-  arenaResponseContextChars: 60_000,
+  arenaResponseContextChars: 150_000,
 };
 
 export class SettingsError extends Error {

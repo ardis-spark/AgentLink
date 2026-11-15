@@ -168,6 +168,7 @@ export class CompanionServer {
       settings: settings.get(),
       activeProjectId: orchestrator.listProjects().activeProjectId,
       dataDir: config.dataDir,
+      relay: orchestrator.relayLink(),
     }));
 
     this.route('GET', '/events', (ctx) => this.openEventStream(ctx));
@@ -207,6 +208,9 @@ export class CompanionServer {
       return { settings: next, gemini: gemini.status() };
     });
 
+    // ---- relay (the browser extension asks what to carry to Arena; the request doubles as its heartbeat) ----
+    this.route('GET', '/relay/work', () => orchestrator.relayWork());
+
     // ---- projects ----
     this.route('GET', '/projects', () => orchestrator.listProjects());
     this.route('POST', '/projects', async (ctx) => {
@@ -216,6 +220,7 @@ export class CompanionServer {
         objective: body.objective as string,
         instructions: body.instructions as string | undefined,
         constraints: body.constraints as string[] | undefined,
+        start: body.start === true,
       });
     });
     this.route('GET', '/projects/:id', (ctx) => orchestrator.getProject(ctx.params.id as string));
@@ -242,11 +247,7 @@ export class CompanionServer {
       return (ctx) => handler(ctx.params.id as string, ctx.params.taskId as string, ctx);
     };
     this.route('GET', '/projects/:id/tasks/:taskId', task((p, t) => ({ task: orchestrator.getTask(p, t) })));
-    this.route('PATCH', '/projects/:id/tasks/:taskId', task(async (p, t, ctx) => ({ task: orchestrator.editTask(p, t, await ctx.body()) })));
-    this.route('POST', '/projects/:id/tasks/:taskId/approve', task((p, t) => ({ task: orchestrator.approveTask(p, t) })));
-    this.route('POST', '/projects/:id/tasks/:taskId/reject', task(async (p, t, ctx) => ({ task: orchestrator.rejectTask(p, t, (await ctx.body()).reason) })));
     this.route('POST', '/projects/:id/tasks/:taskId/cancel', task((p, t) => ({ task: orchestrator.cancelTask(p, t) })));
-    this.route('POST', '/projects/:id/tasks/:taskId/evaluate', task((p, t) => ({ task: orchestrator.retryEvaluation(p, t) })));
     this.route('POST', '/projects/:id/tasks/:taskId/dispatch/claim', task(async (p, t, ctx) => orchestrator.claimDispatch(p, t, await ctx.body())));
     this.route('POST', '/projects/:id/tasks/:taskId/dispatch/confirm', task(async (p, t, ctx) => ({ task: orchestrator.confirmDispatch(p, t, (await ctx.body()).dispatchId) })));
     this.route('POST', '/projects/:id/tasks/:taskId/dispatch/fail', task(async (p, t, ctx) => {
@@ -259,7 +260,25 @@ export class CompanionServer {
         }),
       };
     }));
-    this.route('POST', '/projects/:id/tasks/:taskId/dispatch/reset', task((p, t) => ({ task: orchestrator.resetDispatch(p, t) })));
+    this.route('POST', '/projects/:id/tasks/:taskId/dispatch/reset', task(async (p, t, ctx) => {
+      const body = await ctx.body();
+      return { task: orchestrator.resetDispatch(p, t, { dispatchId: body.dispatchId as string, reason: body.reason as string }) };
+    }));
+    this.route('POST', '/projects/:id/tasks/:taskId/no-response', task(async (p, t, ctx) => {
+      const body = await ctx.body();
+      return { task: orchestrator.recordNoResponse(p, t, { dispatchId: body.dispatchId as string, reason: body.reason as string }) };
+    }));
+    this.route('POST', '/projects/:id/tasks/:taskId/relay', task(async (p, t, ctx) => {
+      const body = await ctx.body();
+      orchestrator.reportRelay(p, t, {
+        dispatchId: (body.dispatchId as string | null | undefined) ?? null,
+        phase: body.phase as never,
+        message: body.message as string,
+        attention: body.attention === true,
+        chars: body.chars as number,
+      });
+      return NO_CONTENT;
+    }));
     this.route('POST', '/projects/:id/tasks/:taskId/arena-response', task(async (p, t, ctx) => {
       const body = await ctx.body();
       return {
@@ -267,6 +286,7 @@ export class CompanionServer {
           dispatchId: (body.dispatchId as string | null | undefined) ?? null,
           text: body.text as string,
           source: body.source as never,
+          ...(body.completion !== undefined ? { completion: body.completion as never } : {}),
         }),
       };
     }));
@@ -420,25 +440,44 @@ export class CompanionServer {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    const send = (event: CompanionEvent): void => {
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
-    };
-    send({ type: 'hello', version: this.deps.version });
-    send({ type: 'gemini', status: this.deps.gemini.status() });
-
-    const unsubscribe = this.deps.bus.subscribe((event) => {
-      if ('projectId' in event && projectId && event.projectId !== projectId) return;
-      send(event);
-    });
-    const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
-    this.streams.add(res);
+    let open = true;
+    let unsubscribe: () => void = () => undefined;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
     const cleanup = (): void => {
-      clearInterval(heartbeat);
+      if (!open) return;
+      open = false;
+      if (heartbeat) clearInterval(heartbeat);
       unsubscribe();
       this.streams.delete(res);
     };
+    // A stream can end at any moment (the page closes, the companion shuts down) while work that produces
+    // events is still running. Writing to it then must be a no-op, never an error inside that work.
+    const write = (chunk: string): void => {
+      if (!open) return;
+      if (res.writableEnded || res.destroyed) {
+        cleanup();
+        return;
+      }
+      res.write(chunk);
+    };
+    const send = (event: CompanionEvent): void => write(`data: ${JSON.stringify(event)}\n\n`);
+    res.on('error', cleanup);
     req.on('close', cleanup);
     res.on('close', cleanup);
+    this.streams.add(res);
+
+    send({ type: 'hello', version: this.deps.version });
+    send({ type: 'gemini', status: this.deps.gemini.status() });
+    unsubscribe = this.deps.bus.subscribe((event) => {
+      if ('projectId' in event && projectId && event.projectId !== projectId) return;
+      send(event);
+    });
+    heartbeat = setInterval(() => write(': keep-alive\n\n'), 15_000);
+    if (!open) {
+      // The stream ended while it was being set up.
+      clearInterval(heartbeat);
+      unsubscribe();
+    }
     return HANDLED;
   }
 }

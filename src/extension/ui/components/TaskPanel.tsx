@@ -1,18 +1,10 @@
 import type { VNode } from 'preact';
 import { useState } from 'preact/hooks';
-import { renderArenaPrompt } from '../../../shared/arenaPrompt.js';
-import type { ArenaExecutionStatus } from '../../../shared/messages.js';
+import { arenaRef, renderArenaPrompt } from '../../../shared/arenaPrompt.js';
 import type { ArenaTask, ProjectView } from '../../../shared/types.js';
 import { store, type WorkspaceState } from '../store.js';
 import { dayAndClock, taskBadge, VERDICT_TEXT } from '../view.js';
 import { AutoTextarea, Button, ConfirmButton, CopyButton, Empty, PaneHeader, Tag } from './common.js';
-
-function lines(value: string): string[] {
-  return value
-    .split('\n')
-    .map((line) => line.replace(/^\s*[-*]\s+/, '').trim())
-    .filter(Boolean);
-}
 
 function hostOf(url: string | null | undefined): string {
   if (!url) return '';
@@ -23,79 +15,25 @@ function hostOf(url: string | null | undefined): string {
   }
 }
 
-// ------------------------------------------------------------------ editor ---
-
-function TaskEditor({ task, onDone }: { task: ArenaTask; onDone: () => void }): VNode {
-  const [title, setTitle] = useState(task.title);
-  const [instructions, setInstructions] = useState(task.instructions);
-  const [context, setContext] = useState(task.context);
-  const [criteria, setCriteria] = useState(task.acceptanceCriteria.join('\n'));
-  const busy = store.state.busy[`edit:${task.id}`];
-  const valid = title.trim() && instructions.trim() && lines(criteria).length > 0;
-
-  return (
-    <form
-      class="task-editor"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (!valid) return;
-        void store.editTask(task.id, { title: title.trim(), instructions: instructions.trim(), context: context.trim(), acceptanceCriteria: lines(criteria) }).then((ok) => {
-          if (ok) onDone();
-        });
-      }}
-    >
-      <div class="field">
-        <label class="label" for="task-title">
-          Title
-        </label>
-        <input id="task-title" class="input" value={title} maxLength={200} onInput={(e) => setTitle((e.currentTarget as HTMLInputElement).value)} />
-      </div>
-      <div class="field">
-        <label class="label" for="task-instructions">
-          What Arena should do
-        </label>
-        <AutoTextarea id="task-instructions" class="textarea" maxRows={16} value={instructions} onInput={(e) => setInstructions((e.currentTarget as HTMLTextAreaElement).value)} />
-      </div>
-      <div class="field">
-        <label class="label" for="task-context">
-          Context for Arena
-        </label>
-        <AutoTextarea id="task-context" class="textarea" maxRows={12} value={context} onInput={(e) => setContext((e.currentTarget as HTMLTextAreaElement).value)} />
-        <p class="field__hint">Arena does not share the coordinator's memory. Include what it needs to know.</p>
-      </div>
-      <div class="field">
-        <label class="label" for="task-criteria">
-          Acceptance criteria
-        </label>
-        <AutoTextarea id="task-criteria" class="textarea" maxRows={10} value={criteria} onInput={(e) => setCriteria((e.currentTarget as HTMLTextAreaElement).value)} />
-        <p class="field__hint">One per line. Gemini checks Arena's reply against these.</p>
-      </div>
-      <div class="button-row">
-        <Button variant="primary" type="submit" busy={busy} disabled={!valid}>
-          Save changes
-        </Button>
-        <Button onClick={onDone}>Discard</Button>
-      </div>
-    </form>
-  );
-}
-
 // ------------------------------------------------------------- sub-sections ---
 
-function ExecutionLine({ task, execution }: { task: ArenaTask; execution: ArenaExecutionStatus | null }): VNode {
+/** What the relay is doing for this task right now, as it reported it. */
+function RelayLine({ task }: { task: ArenaTask }): VNode {
+  const relay = task.relay;
   const sentAt = task.dispatch?.confirmedAt ?? task.dispatch?.claimedAt;
-  const live = execution && (execution.phase === 'generating' || execution.phase === 'settling' || execution.phase === 'submitted' || execution.phase === 'sending');
-  const tone = !execution ? 'off' : execution.phase === 'error' || execution.phase === 'timeout' ? 'warn' : live ? 'busy' : 'ok';
+  const tone = !relay ? 'busy' : relay.attention ? 'warn' : 'busy';
+  const fallback = task.status === 'queued' ? 'Queued for Arena. AgentLink sends it as soon as the Arena tab is free.' : task.status === 'dispatching' ? 'Typing the task into Arena…' : "Waiting for Arena's reply.";
   return (
     <div class="exec" role="status" aria-live="polite">
       <div class="exec__row">
         <span class={`dot dot--${tone}`} aria-hidden="true" />
-        <span class="exec__text">{execution?.message || 'AgentLink is not watching the Arena tab for this task right now. Capture the reply when Arena has finished, or paste it.'}</span>
+        <span class="exec__text">{relay?.message || fallback}</span>
       </div>
       <p class="exec__meta mono">
-        {sentAt ? `sent ${dayAndClock(sentAt)}` : 'not sent'}
+        {sentAt ? `sent ${dayAndClock(sentAt)}` : 'not sent yet'}
         {hostOf(task.dispatch?.tabUrl) ? ` · ${hostOf(task.dispatch?.tabUrl)}` : ''}
-        {execution && execution.chars > 0 ? ` · ${execution.chars.toLocaleString()} characters so far` : ''}
+        {task.dispatch && task.dispatch.attempt > 1 ? ` · attempt ${task.dispatch.attempt}` : ''}
+        {relay && relay.chars > 0 ? ` · ${relay.chars.toLocaleString()} characters so far` : ''}
       </p>
     </div>
   );
@@ -107,8 +45,8 @@ function PasteReply({ task }: { task: ArenaTask }): VNode {
   const busy = store.state.busy[`paste:${task.id}`];
   if (!open) {
     return (
-      <Button small onClick={() => setOpen(true)}>
-        Paste reply…
+      <Button small variant="quiet" onClick={() => setOpen(true)}>
+        Paste the reply by hand…
       </Button>
     );
   }
@@ -148,7 +86,7 @@ function ArenaReply({ task, state }: { task: ArenaTask; state: WorkspaceState })
   const full = cached && cached.id === reply.id ? cached : null;
   const shown = full ?? reply;
   const needsFetch = reply.excerptOnly === true && !full;
-  const source = reply.source === 'auto' ? 'read from the Arena tab' : reply.source === 'manual_capture' ? 'captured on request' : 'pasted by you';
+  const source = reply.source === 'auto' ? 'read from the Arena tab' : reply.source === 'manual_capture' ? 'taken on request' : 'pasted by you';
   return (
     <section class="block">
       <div class="block__head">
@@ -223,101 +161,44 @@ function Evaluation({ task }: { task: ArenaTask }): VNode | null {
 
 // ------------------------------------------------------------------ actions ---
 
-function TaskActions({ task, state, onEdit }: { task: ArenaTask; state: WorkspaceState; onEdit: () => void }): VNode | null {
+/**
+ * Nothing here is needed for the work to proceed. The task moves by itself;
+ * these are the ways to step in: abandon the task, or help when the Arena
+ * page cannot be read.
+ */
+function TaskActions({ task, state }: { task: ArenaTask; state: WorkspaceState }): VNode | null {
   const { busy } = state;
-  const [rejecting, setRejecting] = useState(false);
-  const [reason, setReason] = useState('');
-  const sending = busy[`send:${task.id}`];
-  const paused = state.project?.session.status !== 'running';
+  const session = state.project?.session.status;
+  const cancel = <ConfirmButton small label="Cancel task" confirmLabel="Cancel this task?" busy={busy[`cancel:${task.id}`]} onConfirm={() => void store.cancelTask(task.id)} />;
 
-  if (task.status === 'proposed') {
-    if (rejecting) {
-      return (
-        <form
-          class="reject"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void store.rejectTask(task.id, reason.trim()).then((ok) => {
-              if (ok) setRejecting(false);
-            });
-          }}
-        >
-          <label class="label" for="reject-reason">
-            Why? (optional — Gemini uses this to propose something better)
-          </label>
-          <AutoTextarea id="reject-reason" class="textarea" maxRows={6} value={reason} onInput={(e) => setReason((e.currentTarget as HTMLTextAreaElement).value)} />
-          <div class="button-row">
-            <Button variant="danger" type="submit" busy={busy[`reject:${task.id}`]}>
-              Reject task
-            </Button>
-            <Button onClick={() => setRejecting(false)}>Keep it</Button>
-          </div>
-        </form>
-      );
-    }
+  if (task.status === 'queued' || task.status === 'dispatching') {
     return (
       <div class="decision">
-        <p class="decision__prompt">Nothing is sent until you approve.</p>
+        {session === 'paused' && <p class="note">The session is paused. This task is sent when you resume.</p>}
+        {task.dispatch?.error && <p class="note note--warn">Last attempt: {task.dispatch.error} AgentLink tries again by itself.</p>}
         <div class="button-row">
-          <Button variant="primary" busy={sending} busyLabel="Sending…" disabled={paused} onClick={() => void store.approveAndSend(task.id)}>
-            Approve and send to Arena
+          <Button small variant="quiet" onClick={() => void store.focusArena()}>
+            Go to Arena tab
           </Button>
-          <Button onClick={onEdit}>Edit</Button>
-          <Button variant="danger" onClick={() => setRejecting(true)}>
-            Reject
-          </Button>
-        </div>
-        {paused && <p class="faint">The session is not running. Resume it to approve tasks.</p>}
-      </div>
-    );
-  }
-
-  if (task.status === 'approved') {
-    return (
-      <div class="decision">
-        {task.dispatch?.error && <p class="note note--bad">{task.dispatch.error}</p>}
-        <div class="button-row">
-          <Button variant="primary" busy={sending} busyLabel="Sending…" disabled={paused} onClick={() => void store.approveAndSend(task.id)}>
-            {task.dispatch?.error ? 'Try sending again' : 'Send to Arena'}
-          </Button>
-          <Button busy={sending} disabled={paused} onClick={() => void store.sendManually(task.id)} title="Copies the task and records it as sent, so you can paste it into Arena yourself">
-            Copy and send by hand
-          </Button>
-          <ConfirmButton label="Cancel task" confirmLabel="Cancel this task?" busy={busy[`cancel:${task.id}`]} onConfirm={() => void store.cancelTask(task.id)} />
+          {cancel}
         </div>
       </div>
     );
-  }
-
-  if (task.status === 'dispatching') {
-    return <p class="note">Typing the task into Arena…</p>;
   }
 
   if (task.status === 'awaiting_response') {
     return (
       <div class="decision">
-        {task.dispatch?.unconfirmed && (
-          <p class="note note--warn">
-            AgentLink could not confirm that Arena received this task{task.dispatch.error ? `: ${task.dispatch.error}` : '.'} Look at the Arena tab. If the task is there, wait for the reply and capture it. If it is not, mark it as not sent.
-          </p>
-        )}
+        <p class="decision__prompt">AgentLink collects the reply by itself when Arena has finished. Use these only if it cannot.</p>
         <div class="button-row">
-          <Button variant="primary" busy={busy[`capture:${task.id}`]} busyLabel="Reading…" onClick={() => void store.captureReply(task.id)}>
-            Capture reply now
+          <Button small variant="quiet" busy={busy[`capture:${task.id}`]} busyLabel="Reading…" onClick={() => void store.captureReply(task.id)} title="Hands over what Arena has written so far, without waiting for it to finish">
+            Take the reply as it is now
           </Button>
           <PasteReply task={task} />
           <Button small variant="quiet" onClick={() => void store.focusArena()}>
             Go to Arena tab
           </Button>
-        </div>
-        <div class="button-row">
-          {task.dispatch && <CopyButton text={task.dispatch.prompt} label="Copy task text" />}
-          {task.dispatch?.unconfirmed && (
-            <Button small busy={busy[`reset:${task.id}`]} onClick={() => void store.markNotSent(task.id)}>
-              It was not sent
-            </Button>
-          )}
-          <ConfirmButton small label="Cancel task" confirmLabel="Cancel this task?" busy={busy[`cancel:${task.id}`]} onConfirm={() => void store.cancelTask(task.id)} />
+          {cancel}
         </div>
       </div>
     );
@@ -325,21 +206,12 @@ function TaskActions({ task, state, onEdit }: { task: ArenaTask; state: Workspac
 
   if (task.status === 'evaluating') {
     const running = state.turn?.active && state.turn.kind === 'evaluation';
+    const waiting = session === 'paused' ? 'The reply is saved. Gemini reviews it when the session is resumed.' : session === 'blocked' ? 'The reply is saved. Gemini reviews it when the session continues.' : 'The reply is saved. Gemini reviews it next.';
     return (
       <div class="decision">
-        {task.evaluationError ? (
-          <p class="note note--bad">The review did not finish: {task.evaluationError}</p>
-        ) : (
-          <p class="note">{running ? "Gemini is reviewing Arena's reply against the acceptance criteria…" : paused ? 'The reply is saved. Gemini will review it when the session is resumed.' : 'Waiting for Gemini to review the reply.'}</p>
-        )}
-        {!running && !paused && (
-          <div class="button-row">
-            <Button variant="primary" busy={busy[`evaluate:${task.id}`]} onClick={() => void store.retryEvaluation(task.id)}>
-              {task.evaluationError ? 'Run the review again' : 'Run the review'}
-            </Button>
-            <ConfirmButton label="Cancel task" confirmLabel="Cancel this task?" busy={busy[`cancel:${task.id}`]} onConfirm={() => void store.cancelTask(task.id)} />
-          </div>
-        )}
+        {task.evaluationError && <p class="note note--warn">The last review did not finish: {task.evaluationError}</p>}
+        <p class="note">{running ? "Gemini is reviewing Arena's reply against the acceptance criteria…" : waiting}</p>
+        {!running && <div class="button-row">{cancel}</div>}
       </div>
     );
   }
@@ -349,13 +221,12 @@ function TaskActions({ task, state, onEdit }: { task: ArenaTask; state: Workspac
 // -------------------------------------------------------------------- card ---
 
 function TaskCard({ task, project, state }: { task: ArenaTask; project: ProjectView; state: WorkspaceState }): VNode {
-  const [editing, setEditing] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
   const badge = taskBadge(task);
-  const execution = state.executions[task.id] ?? null;
+  const inRelay = task.status === 'queued' || task.status === 'dispatching' || task.status === 'awaiting_response';
   const milestone = project.milestones.find((m) => m.id === task.milestoneId);
-  // Before sending this is a faithful preview; afterwards the recorded text is shown.
-  const prompt = task.dispatch?.prompt ?? renderArenaPrompt({ task, projectName: project.name, constraints: project.constraints });
+  // The recorded text once sent. Before that, a preview that differs from the real one only in its reference code.
+  const prompt = task.dispatch?.prompt ?? renderArenaPrompt({ task, projectName: project.name, constraints: project.constraints, ref: arenaRef(task.id, 'preview') });
 
   return (
     <article class={`task task--${task.status}`}>
@@ -363,7 +234,6 @@ function TaskCard({ task, project, state }: { task: ArenaTask; project: ProjectV
         <div class="task__ids">
           <span class="task__id mono">{task.id}</span>
           <Tag tone={badge.tone}>{badge.label}</Tag>
-          {task.editedByUser && <span class="faint">edited by you</span>}
         </div>
         <h3 class="task__title">{task.title}</h3>
         {milestone && (
@@ -373,10 +243,7 @@ function TaskCard({ task, project, state }: { task: ArenaTask; project: ProjectV
         )}
       </header>
 
-      {editing && task.status === 'proposed' ? (
-        <TaskEditor task={task} onDone={() => setEditing(false)} />
-      ) : (
-        <>
+      <>
           {task.rationale && (
             <p class="task__why">
               <span class="label">Why now</span> {task.rationale}
@@ -407,7 +274,7 @@ function TaskCard({ task, project, state }: { task: ArenaTask; project: ProjectV
                 <span class="disclosure__mark" aria-hidden="true">
                   {showPrompt ? '−' : '+'}
                 </span>
-                {task.dispatch ? 'Exact text sent to Arena' : 'Exact text that will be sent to Arena'}
+                {task.dispatch ? 'Exact text sent to Arena' : 'Text that will be sent to Arena'}
               </button>
               {showPrompt && <CopyButton text={prompt} />}
             </div>
@@ -418,17 +285,12 @@ function TaskCard({ task, project, state }: { task: ArenaTask; project: ProjectV
             )}
           </section>
 
-          {task.status === 'awaiting_response' && <ExecutionLine task={task} execution={execution} />}
-          {task.rejection && (
-            <p class="note">
-              Rejected{task.rejection.reason ? `: ${task.rejection.reason}` : ' without a reason.'}
-            </p>
-          )}
+          {inRelay && <RelayLine task={task} />}
+          {task.closedReason && <p class="note">{task.closedReason}</p>}
           <ArenaReply task={task} state={state} />
           <Evaluation task={task} />
-          <TaskActions task={task} state={state} onEdit={() => setEditing(true)} />
-        </>
-      )}
+          <TaskActions task={task} state={state} />
+      </>
     </article>
   );
 }
@@ -460,7 +322,7 @@ export function TaskPanel({ state, selectedTaskId, onSelect }: { state: Workspac
             <TaskCard task={selected} project={project} state={state} key={selected.id} />
           </>
         ) : (
-          <Empty title="No task yet.">When Gemini proposes work for Arena it appears here for you to approve, edit or reject.</Empty>
+          <Empty title="No task yet.">Each task Gemini sends to Arena appears here, with Arena's reply and Gemini's review of it.</Empty>
         )}
 
         {history.length > 1 && (

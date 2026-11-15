@@ -2,9 +2,9 @@ import type { ContentRequest } from '../../shared/messages.js';
 import { createArenaAdapter } from './arenaAdapter.js';
 
 /**
- * Content script entry point for Arena tabs. It only exchanges messages with
- * AgentLink's own background script; it holds no credentials and makes no
- * network requests.
+ * Content script entry point for Arena tabs. It only answers requests from
+ * AgentLink's own background script; it holds no credentials, keeps no state
+ * and makes no network requests.
  */
 declare global {
   interface Window {
@@ -16,13 +16,7 @@ if (!window.__agentlinkArenaAdapter) {
   // The script can be injected again into a tab that was open before the extension loaded; run once.
   window.__agentlinkArenaAdapter = true;
 
-  const adapter = createArenaAdapter({
-    doc: document,
-    win: window,
-    emit: (event) => {
-      void browser.runtime.sendMessage(event).catch(() => undefined);
-    },
-  });
+  const adapter = createArenaAdapter({ doc: document, win: window });
 
   browser.runtime.onMessage.addListener((message: unknown) => {
     const request = message as ContentRequest | null;

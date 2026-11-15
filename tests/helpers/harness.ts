@@ -12,7 +12,7 @@ export interface Harness {
   companion: Companion;
   dataDir: string;
   logs: string[];
-  /** Builds a second companion on the same data directory, as after a process restart. */
+  /** Ends the running companion as a killed process would, and builds a new one on the same data directory. */
   restart: () => Companion;
   cleanup: () => Promise<void>;
 }
@@ -22,6 +22,9 @@ export interface HarnessOptions {
   saveKey?: string | null;
   settings?: Partial<CompanionSettings>;
   envModel?: string | null;
+  /** Waits before a failed coordinator turn is repeated. */
+  retryDelaysMs?: readonly number[];
+  relayOfflineMs?: number;
 }
 
 const FAST: Partial<CompanionSettings> = {
@@ -56,6 +59,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
       logLevel: 'debug' as LogLevel,
       logSink: (_level, line) => logs.push(line),
       gemini: { retryBaseDelayMs: 5, retryMaxDelayMs: 20, modelCacheMs: 60_000 },
+      orchestrator: { retryDelaysMs: options.retryDelaysMs ?? [5, 5], relayOfflineMs: options.relayOfflineMs ?? 45_000 },
     });
     companion.settings.update({ ...FAST, ...options.settings });
     return companion;
@@ -71,12 +75,17 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     dataDir,
     logs,
     restart: () => {
+      // The previous process is gone: it must not go on working or writing next to the new one.
+      for (const c of created) c.orchestrator.dispose();
       const next = build();
       created.push(next);
       return next;
     },
     cleanup: async () => {
-      for (const c of created) await c.server.close().catch(() => undefined);
+      for (const c of created) {
+        c.orchestrator.dispose();
+        await c.server.close().catch(() => undefined);
+      }
       await fake.stop();
       rmSync(dataDir, { recursive: true, force: true });
     },

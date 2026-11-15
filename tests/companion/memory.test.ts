@@ -27,7 +27,7 @@ function readProjectFile(id: string): Project {
   return JSON.parse(readFileSync(join(h.dataDir, 'projects', `${id}.json`), 'utf8')) as Project;
 }
 
-/** Builds a project with a plan, a decision, an issue, one verified task and a second proposed task. */
+/** Builds a project with a plan, a decision, an issue, one verified task and a second task queued for Arena. */
 async function populatedProject(): Promise<string> {
   const o = h.companion.orchestrator;
   const id = o.createProject({
@@ -43,21 +43,20 @@ async function populatedProject(): Promise<string> {
       { name: 'record_decision', args: { summary: 'Use the built-in test runner', rationale: 'No new dependencies.' } },
       { name: 'record_issue', args: { title: 'CI is not configured yet', details: 'There is no workflow file, so nothing runs on push.', severity: 'medium' } },
     ]),
-    toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, milestone_id: 'M-1' } }]),
-    textResponse('Plan recorded; first task proposed.'),
+    toolResponse([{ name: 'dispatch_arena_task', args: { ...PROPOSAL, milestone_id: 'M-1' } }]),
+    textResponse('Plan recorded; first task sent.'),
   );
   await o.sendMessage(id, 'Start with the health endpoint.').done;
 
-  o.approveTask(id, 'T-1');
   const claim = o.claimDispatch(id, 'T-1', { tabId: 1, tabUrl: 'https://arena.ai/a' });
   o.confirmDispatch(id, 'T-1', claim.dispatchId);
   h.fake.enqueue(
     toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-1', verdict: 'complete', summary: 'Endpoint added and tested.', evidence: ['3 passed, 0 failed'] } }]),
     toolResponse([
       { name: 'update_milestone', args: { milestone_id: 'M-1', status: 'done' } },
-      { name: 'propose_arena_task', args: { ...PROPOSAL, title: 'Add the metrics endpoint', instructions: 'Add GET /metrics with request counters.', milestone_id: 'M-2' } },
+      { name: 'dispatch_arena_task', args: { ...PROPOSAL, title: 'Add the metrics endpoint', instructions: 'Add GET /metrics with request counters.', milestone_id: 'M-2' } },
     ]),
-    textResponse('T-1 verified; metrics task proposed.'),
+    textResponse('T-1 verified; metrics task sent.'),
   );
   o.recordArenaResponse(id, 'T-1', { dispatchId: claim.dispatchId, text: REPLY, source: 'auto' });
   await o.whenIdle(id);
@@ -84,7 +83,7 @@ describe('persistent project memory', () => {
     ]);
     expect(onDisk.tasks.map((t) => [t.id, t.status])).toEqual([
       ['T-1', 'completed'],
-      ['T-2', 'proposed'],
+      ['T-2', 'queued'],
     ]);
     expect(onDisk.tasks[0]?.arenaResponse?.text).toBe(REPLY);
     expect(onDisk.tasks[0]?.evaluation?.evidence).toEqual(['3 passed, 0 failed']);
@@ -94,7 +93,7 @@ describe('persistent project memory', () => {
     expect(onDisk.conversation.length).toBeGreaterThanOrEqual(4);
     expect(onDisk.transcript.length).toBeGreaterThan(onDisk.conversation.length);
     expect(onDisk.timeline.map((e) => e.title)).toEqual(
-      expect.arrayContaining(['Project created', 'Task T-1 approved by you', 'Task T-1 sent to Arena', 'Arena replied to T-1']),
+      expect.arrayContaining(['Project created', 'Session started', 'Task T-1 sent to Arena', 'Arena replied to T-1']),
     );
   });
 
@@ -115,7 +114,7 @@ describe('persistent project memory', () => {
   it('keeps long-term memory separate from the conversation: memory survives compaction', async () => {
     const id = await populatedProject();
     const o = h.companion.orchestrator;
-    h.companion.settings.update({ contextBudgetChars: 20_000 });
+    h.companion.settings.update({ contextBudgetChars: 24_000 });
     const filler = 'The quick brown fox jumps over the lazy dog. '.repeat(120); // ~5.4k chars
 
     for (let i = 0; i < 4; i += 1) {
@@ -205,25 +204,27 @@ describe('persistent project memory', () => {
 });
 
 describe('restart recovery', () => {
-  it('restores the whole project and comes back paused, never running on its own', async () => {
+  it('restores the whole project and carries on by itself, without asking Gemini anything it already knows', async () => {
     const id = await populatedProject();
     const requestsBefore = h.fake.requests.length;
 
     const next = h.restart();
     await next.orchestrator.whenIdle(id);
-    expect(h.fake.requests).toHaveLength(requestsBefore); // nothing was sent to Gemini by starting up
+    // T-2 is queued for Arena, so the next move is the extension's: nothing needs to be asked of Gemini.
+    expect(h.fake.requests).toHaveLength(requestsBefore);
 
     const view = next.orchestrator.getProject(id);
     expect(view.project).toMatchObject({ name: 'Billing service', currentMilestoneId: 'M-2', currentTaskId: 'T-2' });
-    expect(view.project.session).toMatchObject({ status: 'paused', pauseReason: 'restart' });
-    expect(view.project.tasks.map((t) => t.status)).toEqual(['completed', 'proposed']);
+    expect(view.project.session).toMatchObject({ status: 'running', blocker: null });
+    expect(view.project.tasks.map((t) => t.status)).toEqual(['completed', 'queued']);
     expect(view.project.decisions).toHaveLength(1);
     expect(view.project.issues).toHaveLength(1);
-    expect(view.conversation.at(-1)?.text).toBe('T-1 verified; metrics task proposed.');
-    expect(view.project.timeline.at(-1)?.title).toBe('Session restored after restart');
+    expect(view.conversation.at(-1)?.text).toBe('T-1 verified; metrics task sent.');
+    expect(view.project.timeline.at(-1)?.title).toBe('Session resumed after a restart');
+    // The queued task is offered to the extension at once.
+    expect(next.orchestrator.relayWork().items.map((i) => [i.task.id, i.task.status])).toEqual([['T-2', 'queued']]);
 
-    // Resuming continues the same conversation with the same history.
-    next.orchestrator.controlSession(id, 'resume');
+    // The same conversation continues with the same history.
     h.fake.enqueue(textResponse('Welcome back.'));
     await next.orchestrator.sendMessage(id, 'where were we?').done;
     const contents = h.fake.lastGenerate().body.contents;
@@ -232,10 +233,25 @@ describe('restart recovery', () => {
     expect(JSON.stringify(contents)).toContain(REPLY);
   });
 
+  it('picks the work up again after a restart when nothing was in motion', async () => {
+    const o = h.companion.orchestrator;
+    h.fake.enqueue(toolResponse([{ name: 'set_plan', args: { milestones: [{ title: 'Health endpoint' }] } }]), { kind: 'hang' });
+    const id = o.createProject({ name: 'Billing service', objective: 'Expose a health endpoint', start: true }).project.id;
+    await waitFor(() => readProjectFile(id).milestones.length === 1 && h.fake.generateRequests.length === 2, 'the plan to be saved and the turn to go on');
+
+    // The process dies in the middle of a turn; the new one continues without being told to.
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: PROPOSAL }]), textResponse('Sent.'));
+    const next = h.restart();
+    await next.orchestrator.whenIdle(id);
+    const view = next.orchestrator.getProject(id);
+    expect(view.project.session.status).toBe('running');
+    expect(view.project.tasks.map((t) => [t.id, t.status])).toEqual([['T-1', 'queued']]);
+    expect(view.project.milestones).toHaveLength(1);
+  });
+
   it('does not re-send a task that was mid-delivery when the app stopped', async () => {
     const id = await populatedProject();
     const o = h.companion.orchestrator;
-    o.approveTask(id, 'T-2');
     o.claimDispatch(id, 'T-2', { tabId: 4, tabUrl: 'https://arena.ai/b' });
     expect(readProjectFile(id).tasks[1]?.status).toBe('dispatching');
 
@@ -245,7 +261,8 @@ describe('restart recovery', () => {
     expect(task.dispatch).toMatchObject({ unconfirmed: true, attempt: 1 });
     expect(task.dispatch?.error).toContain('restarted');
 
-    next.orchestrator.controlSession(id, 'resume');
+    // It is offered to the extension for checking against the page, not for sending again.
+    expect(next.orchestrator.relayWork().items.map((i) => [i.task.id, i.task.status])).toEqual([['T-2', 'awaiting_response']]);
     let refused: unknown;
     try {
       next.orchestrator.claimDispatch(id, 'T-2');
@@ -255,28 +272,49 @@ describe('restart recovery', () => {
     expect(refused).toBeInstanceOf(OrchestratorError);
     expect((refused as OrchestratorError).code).toBe('not_dispatchable');
 
-    // If Arena did receive it, the reply can still be captured and evaluated.
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'complete', summary: 'Metrics added.', evidence: ['GET /metrics now returns counters'] } }]), textResponse('Verified.'));
-    next.orchestrator.recordArenaResponse(id, 'T-2', { dispatchId: task.dispatch!.dispatchId, text: 'GET /metrics now returns counters. Tests pass.', source: 'manual_capture' });
+    // If Arena did receive it, the reply is collected and evaluated as usual.
+    h.fake.enqueue(
+      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'complete', summary: 'Metrics added.', evidence: ['GET /metrics now returns counters'] } }]),
+      toolResponse([
+        { name: 'update_milestone', args: { milestone_id: 'M-2', status: 'done' } },
+        { name: 'mark_objective_complete', args: { summary: 'Both endpoints exist and are tested.' } },
+      ]),
+      textResponse('Verified.'),
+    );
+    next.orchestrator.recordArenaResponse(id, 'T-2', { dispatchId: task.dispatch!.dispatchId, text: 'GET /metrics now returns counters. Tests pass.', source: 'auto' });
     await next.orchestrator.whenIdle(id);
     expect(next.orchestrator.getTask(id, 'T-2').status).toBe('completed');
+    expect(next.orchestrator.getProject(id).project.session.status).toBe('completed');
+  });
+
+  it('re-sends a task that was mid-delivery only after the page showed it never arrived', async () => {
+    const id = await populatedProject();
+    h.companion.orchestrator.claimDispatch(id, 'T-2', { tabId: 4, tabUrl: 'https://arena.ai/b' });
+    const next = h.restart();
+    const task = next.orchestrator.getTask(id, 'T-2');
+    next.orchestrator.resetDispatch(id, 'T-2', { dispatchId: task.dispatch!.dispatchId, reason: 'The task is not in the Arena conversation.' });
+    expect(next.orchestrator.getTask(id, 'T-2').status).toBe('queued');
+    expect(next.orchestrator.claimDispatch(id, 'T-2').task.dispatch?.attempt).toBe(2);
   });
 
   it('keeps waiting for Arena across a restart and evaluates the reply afterwards', async () => {
     const id = await populatedProject();
     const o = h.companion.orchestrator;
-    o.approveTask(id, 'T-2');
     const claim = o.claimDispatch(id, 'T-2');
     o.confirmDispatch(id, 'T-2', claim.dispatchId);
 
     const next = h.restart();
     expect(next.orchestrator.getTask(id, 'T-2')).toMatchObject({ status: 'awaiting_response' });
     expect(next.orchestrator.getTask(id, 'T-2').dispatch).toMatchObject({ dispatchId: claim.dispatchId, unconfirmed: false });
-    next.orchestrator.controlSession(id, 'resume');
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'failed', summary: 'Arena reported an error.', evidence: ['TypeError: app.get is not a function'] } }]), textResponse('It failed.'));
+    h.fake.enqueue(
+      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'failed', summary: 'Arena reported an error.', evidence: ['TypeError: app.get is not a function'] } }]),
+      toolResponse([{ name: 'dispatch_arena_task', args: { ...PROPOSAL, title: 'Fix the metrics endpoint', instructions: 'The previous attempt crashed with a TypeError; fix it.' } }]),
+      textResponse('It failed; a fix is on its way.'),
+    );
     next.orchestrator.recordArenaResponse(id, 'T-2', { dispatchId: claim.dispatchId, text: 'It crashed with TypeError: app.get is not a function', source: 'auto' });
     await next.orchestrator.whenIdle(id);
     expect(next.orchestrator.getTask(id, 'T-2').status).toBe('failed');
+    expect(next.orchestrator.getTask(id, 'T-3').status).toBe('queued');
   });
 
   it('repairs a reply that was being streamed when the process died', async () => {
@@ -288,26 +326,25 @@ describe('restart recovery', () => {
     expect(readProjectFile(id).activeTurn).not.toBeNull();
 
     // Simulate a crash: a new process reads whatever was on disk at this moment.
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: PROPOSAL }]), textResponse('Here is the task.'));
     const next = h.restart();
-    const view = next.orchestrator.getProject(id);
-    expect(view.conversation.at(-1)).toMatchObject({ role: 'coordinator', status: 'interrupted' });
-    expect(view.project.session.status).toBe('paused');
-    expect(next.orchestrator.turnState(id).active).toBe(false);
-    const stored = next.store.get(id)!;
-    expect(stored.activeTurn).toBeNull();
-    expect(stored.transcript.at(-1)?.role).toBe('model');
+    const repaired = next.orchestrator.getProject(id).conversation.find((e) => e.role === 'coordinator');
+    expect(repaired).toMatchObject({ role: 'coordinator', status: 'interrupted' });
+    await next.orchestrator.whenIdle(id);
 
-    next.orchestrator.controlSession(id, 'resume');
-    h.fake.enqueue(textResponse('Here is the full answer.'));
-    await next.orchestrator.sendMessage(id, 'please repeat').done;
-    expect(h.fake.lastGenerate().body.contents.map((c: { role: string }) => c.role)).toEqual(['user', 'model', 'user']);
-    await o.whenIdle(id);
+    // The interrupted reply is closed off in the history, and the session went straight on.
+    const sent = h.fake.lastGenerate().body.contents as { role: string; parts: { text?: string }[] }[];
+    expect(sent.slice(0, 3).map((c) => c.role)).toEqual(['user', 'model', 'user']);
+    expect(sent[2]?.parts[0]?.text).toContain('restarted');
+    const view = next.orchestrator.getProject(id);
+    expect(view.project.session.status).toBe('running');
+    expect(view.project.tasks.map((t) => t.status)).toEqual(['queued']);
+    expect(next.store.get(id)!.activeTurn).toBeNull();
   });
 
   it('holds an unevaluated Arena reply across a restart and evaluates it on resume', async () => {
     const id = await populatedProject();
     const o = h.companion.orchestrator;
-    o.approveTask(id, 'T-2');
     const claim = o.claimDispatch(id, 'T-2');
     o.confirmDispatch(id, 'T-2', claim.dispatchId);
     o.controlSession(id, 'pause');
@@ -315,10 +352,74 @@ describe('restart recovery', () => {
 
     const next = h.restart();
     expect(next.orchestrator.getTask(id, 'T-2').status).toBe('evaluating');
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'complete', summary: 'ok', evidence: ['npm test: 5 passed'] } }]), textResponse('Verified after restart.'));
+    h.fake.enqueue(
+      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'complete', summary: 'ok', evidence: ['npm test: 5 passed'] } }]),
+      toolResponse([
+        { name: 'update_milestone', args: { milestone_id: 'M-2', status: 'done' } },
+        { name: 'mark_objective_complete', args: { summary: 'Both endpoints exist and are tested.' } },
+      ]),
+      textResponse('Verified after restart.'),
+    );
     next.orchestrator.controlSession(id, 'resume');
     await next.orchestrator.whenIdle(id);
     expect(next.orchestrator.getTask(id, 'T-2').status).toBe('completed');
+  });
+
+  it('carries on with a project saved by the version that waited for approval: its sent task is followed, its proposed task goes out', async () => {
+    const id = await populatedProject();
+    const o = h.companion.orchestrator;
+    const claim = o.claimDispatch(id, 'T-2', { tabId: 4, tabUrl: 'https://arena.ai/b' });
+    o.confirmDispatch(id, 'T-2', claim.dispatchId);
+
+    // Rewrite the file the way version 1.0.0 would have left it: T-2 approved by the user and sent to Arena,
+    // the session paused by a restart, and none of the fields the autonomous loop added.
+    const file = join(h.dataDir, 'projects', `${id}.json`);
+    const old = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+    old.session = { status: 'paused', startedAt: old.session.startedAt, updatedAt: old.session.updatedAt, pauseReason: 'restart', tasksDispatched: 2, note: 'Paused after a restart.' };
+    delete old.pendingNotices;
+    for (const task of old.tasks) {
+      delete task.relay;
+      delete task.evaluationAttempts;
+      delete task.closedReason;
+      if (task.dispatch) delete task.dispatch.ref;
+      if (task.arenaResponse) delete task.arenaResponse.completion;
+      Object.assign(task, { editedByUser: false, approvedAt: task.createdAt, rejection: null });
+    }
+    writeFileSync(file, JSON.stringify(old));
+
+    const requestsBefore = h.fake.generateRequests.length;
+    const next = h.restart();
+    const view = next.orchestrator.getProject(id).project;
+    expect(view.session).toMatchObject({ status: 'running', blocker: null, idleTurns: 0 });
+    expect(view.session).not.toHaveProperty('pauseReason');
+    const task = next.orchestrator.getTask(id, 'T-2');
+    expect(task).toMatchObject({ status: 'awaiting_response', relay: null, evaluationAttempts: 0, closedReason: null });
+    expect(task.dispatch).toMatchObject({ dispatchId: claim.dispatchId, ref: '', unconfirmed: false });
+    expect(task).not.toHaveProperty('approvedAt');
+    expect(next.orchestrator.getTask(id, 'T-1').arenaResponse?.completion).toBe('quiet');
+    // The task Arena already has is handed to the extension to collect its report; Gemini is not asked anything.
+    expect(next.orchestrator.relayWork().items.map((i) => [i.task.id, i.task.status])).toEqual([['T-2', 'awaiting_response']]);
+    expect(h.fake.generateRequests).toHaveLength(requestsBefore);
+
+    // The report that was waiting in the Arena tab is reviewed, and the next task follows without anyone approving it.
+    h.fake.enqueue(
+      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-2', verdict: 'complete', summary: 'Metrics added.', evidence: ['GET /metrics now returns counters'] } }]),
+      toolResponse([{ name: 'dispatch_arena_task', args: { ...PROPOSAL, title: 'Document both endpoints', instructions: 'Describe GET /health and GET /metrics in README.md.' } }]),
+      textResponse('T-2 is verified. T-3 is on its way.'),
+    );
+    next.orchestrator.recordArenaResponse(id, 'T-2', { dispatchId: claim.dispatchId, text: 'GET /metrics now returns counters. Tests pass.', source: 'auto', completion: 'quiet' });
+    await next.orchestrator.whenIdle(id);
+    expect(next.orchestrator.getTask(id, 'T-2').status).toBe('completed');
+    expect(next.orchestrator.getTask(id, 'T-3').status).toBe('queued');
+    expect(next.orchestrator.relayWork().items.map((i) => i.task.id)).toEqual(['T-3']);
+
+    // A task that the old version had only proposed is queued for Arena as it is.
+    const legacy = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+    legacy.tasks[2].status = 'proposed';
+    writeFileSync(file, JSON.stringify(legacy));
+    const again = h.restart();
+    expect(again.orchestrator.getTask(id, 'T-3').status).toBe('queued');
+    expect(again.orchestrator.claimDispatch(id, 'T-3').prompt).toContain('Task T-3: Document both endpoints');
   });
 
   it('keeps the pairing token, settings and saved key across restarts', async () => {

@@ -10,7 +10,7 @@ const BLOCK_TAGS = new Set([
   'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION', 'SUMMARY', 'TABLE', 'TR', 'UL',
 ]);
 /** Page furniture that is never part of a reply. */
-const CHROME_SELECTOR = 'nav, aside, header, footer, [role="navigation"], [role="complementary"], [role="banner"], [role="contentinfo"], [role="tooltip"], [role="menu"]';
+export const CHROME_SELECTOR = 'nav, aside, header, footer, [role="navigation"], [role="complementary"], [role="banner"], [role="contentinfo"], [role="tooltip"], [role="menu"]';
 /** Buttons with short labels are controls ("Copy", "Retry"); longer ones are usually collapsible content headers. */
 const CONTROL_LABEL_MAX = 24;
 

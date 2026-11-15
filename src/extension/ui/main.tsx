@@ -9,7 +9,7 @@ import { PairingForm, SettingsDrawer, type SettingsSection } from './components/
 import { TaskPanel } from './components/TaskPanel.js';
 import { TopBar } from './components/TopBar.js';
 import { store, useWorkspace, type WorkspaceState } from './store.js';
-import { LINK_TEXT } from './view.js';
+import { attentionOf, LINK_TEXT } from './view.js';
 
 type View = 'chat' | 'task' | 'plan' | 'activity';
 
@@ -99,8 +99,7 @@ function App(): VNode {
     setView('task');
   };
 
-  const openTask = project?.tasks.find((t) => t.id === project.currentTaskId);
-  const needsYou = openTask?.status === 'proposed' || (openTask?.status === 'awaiting_response' && openTask.dispatch?.unconfirmed === true) || (openTask?.status === 'evaluating' && Boolean(openTask.evaluationError));
+  const needsYou = attentionOf(project, state.relay) !== null;
   const tabs: { id: View; label: string }[] = [
     { id: 'chat', label: 'Coordinator' },
     { id: 'task', label: 'Task' },
@@ -126,7 +125,7 @@ function App(): VNode {
       <main class="setup">
         <div class="setup__card">
           <h1 class="setup__title">{editing ? 'Project brief' : state.projects.length === 0 ? 'Start your first project' : 'New project'}</h1>
-          {!editing && <p class="setup__lead">Give Gemini the goal. It plans the work, proposes one task at a time for Arena, and checks every reply before moving on.</p>}
+          {!editing && <p class="setup__lead">Give the objective once. Gemini plans the work, AgentLink sends each task to Arena, waits for the reply, has Gemini check it, and carries on with the next task until the objective is met. You only hear from it if it truly needs you.</p>}
           <ProjectForm project={editing} key={editing?.id ?? 'new'} onDone={() => setProjectForm(null)} onCancel={state.projects.length > 0 ? () => setProjectForm(null) : undefined} />
         </div>
       </main>
@@ -148,7 +147,7 @@ function App(): VNode {
     const activity = <TimelinePanel project={project} onShowTask={showTask} />;
     body = (
       <main class="workspace">
-        <RelayRail state={state} onEditProject={() => setProjectForm('edit')} />
+        <RelayRail state={state} onEditProject={() => setProjectForm('edit')} onOpenSettings={openSettings} />
         {wide ? (
           <div class="columns">
             {chat}
@@ -171,7 +170,7 @@ function App(): VNode {
               {tabs.map((tab) => (
                 <button type="button" role="tab" class="switch__tab" aria-selected={view === tab.id} key={tab.id} onClick={() => setView(tab.id)}>
                   {tab.label}
-                  {tab.id === 'task' && needsYou && view !== 'task' && (
+                  {tab.id === 'chat' && needsYou && view !== 'chat' && (
                     <>
                       <span class="switch__flag" aria-hidden="true" />
                       <span class="visually-hidden"> (needs you)</span>

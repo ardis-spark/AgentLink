@@ -11,13 +11,20 @@ export const ARENA_URL_PATTERNS = [
 export interface ArenaAdapterConfig {
   composerSelector: string;
   sendButtonSelector: string;
-  /** Matches assistant messages; the last match is treated as the response. */
+  /** Matches assistant messages; everything they contain after the sent task is the reply. */
   responseSelector: string;
   /** Matches an element that is only present while Arena is still working. */
   busySelector: string;
-  /** How long the page must stay unchanged before a response counts as finished. */
+  /**
+   * How long Arena must be idle and the reply unchanged before a reply that
+   * lacks the completion line counts as finished.
+   */
   settleMs: number;
-  /** Give up watching after this long (the response can still be captured manually). */
+  /**
+   * Longest time without any visible change before AgentLink stops waiting:
+   * what Arena has written by then is handed over marked as possibly
+   * incomplete, or the task is closed as "no reply" if nothing was written.
+   */
   maxWaitMs: number;
 }
 
@@ -27,7 +34,7 @@ export const DEFAULT_ARENA_ADAPTER_CONFIG: ArenaAdapterConfig = {
   responseSelector: '',
   busySelector: '',
   settleMs: 12_000,
-  maxWaitMs: 45 * 60_000,
+  maxWaitMs: 20 * 60_000,
 };
 
 export interface ArenaPageStatus {
@@ -39,7 +46,8 @@ export interface ArenaPageStatus {
   composerFound: boolean;
   sendButtonFound: boolean;
   busy: boolean;
-  watchingDispatchId: string | null;
+  /** The beginning of whatever text is sitting in the message box (empty when the box is empty). */
+  composerDraft: string;
 }
 
 export interface ArenaTabInfo {
@@ -67,82 +75,52 @@ export interface ArenaConnectionTest {
   message: string;
 }
 
-export type ArenaExecutionPhase =
-  | 'idle'
-  | 'sending'
-  | 'submitted'
-  | 'needs_manual_send'
-  | 'generating'
-  | 'settling'
-  | 'captured'
-  | 'timeout'
-  | 'error';
-
-export interface ArenaExecutionStatus {
-  projectId: string;
-  taskId: string;
-  dispatchId: string | null;
-  phase: ArenaExecutionPhase;
-  message: string;
-  chars: number;
-  updatedAt: number;
-}
-
 // ------------------------------------------------ background ⇄ content script
+//
+// The adapter in the Arena tab keeps no state of its own. The background
+// script asks it questions ("is this task in the page? what does the reply
+// look like right now?") and decides everything itself, so a reloaded page, a
+// navigation or a throttled background tab cannot lose track of a task.
 
 export interface SubmitPromptMessage {
   type: 'agentlink:arena:submit';
-  projectId: string;
-  taskId: string;
-  dispatchId: string;
   prompt: string;
+  /** Reference code of this delivery attempt (part of the prompt). */
+  ref: string;
   config: ArenaAdapterConfig;
 }
 
 export type ContentRequest =
   | { type: 'agentlink:arena:ping'; config: ArenaAdapterConfig }
   | SubmitPromptMessage
-  | {
-      type: 'agentlink:arena:watch';
-      projectId: string;
-      taskId: string;
-      dispatchId: string;
-      prompt: string;
-      config: ArenaAdapterConfig;
-    }
-  | { type: 'agentlink:arena:capture'; prompt: string; config: ArenaAdapterConfig }
-  | { type: 'agentlink:arena:cancel'; dispatchId: string | null };
+  | { type: 'agentlink:arena:probe'; prompt: string; ref: string; config: ArenaAdapterConfig }
+  | { type: 'agentlink:arena:capture'; prompt: string; ref: string; config: ArenaAdapterConfig };
 
 export type SubmitPromptResult =
   | { ok: true; confirmed: true }
   | { ok: false; submitted: false | 'unknown'; error: string };
 
-export type CaptureResult = { ok: true; text: string } | { ok: false; error: string };
+/** A snapshot of one task in the Arena page, taken on request. */
+export interface ProbeResult {
+  ok: true;
+  url: string;
+  /** The message carrying this task is in the conversation. */
+  found: boolean;
+  /** How it was recognised: by its reference code, by its text, or only by its heading. */
+  match: 'ref' | 'prompt' | 'heading' | null;
+  /** Arena shows that it is still working. */
+  busy: boolean;
+  /** Characters of reply text after the task's message. */
+  chars: number;
+  /** Changes whenever the reply text changes. */
+  digest: string;
+  /** The reply ends its report with the completion line that was asked for. */
+  marker: boolean;
+  /** The message box still holds this task: it was typed but not sent. */
+  composerHoldsPrompt: boolean;
+}
 
-/** Content script → background notifications. */
-export type ContentEvent =
-  | {
-      type: 'agentlink:arena:progress';
-      projectId: string;
-      taskId: string;
-      dispatchId: string;
-      generating: boolean;
-      chars: number;
-    }
-  | {
-      type: 'agentlink:arena:response';
-      projectId: string;
-      taskId: string;
-      dispatchId: string;
-      text: string;
-    }
-  | {
-      type: 'agentlink:arena:timeout';
-      projectId: string;
-      taskId: string;
-      dispatchId: string;
-      chars: number;
-    };
+export type CaptureResult = { ok: true; text: string; marker: boolean; busy: boolean } | { ok: false; error: string };
 
 // ------------------------------------------------------- UI ⇄ background
 
@@ -151,28 +129,12 @@ export type UiRequest =
   | { type: 'agentlink:ui:setPreferredTab'; tabId: number | null }
   | { type: 'agentlink:ui:testArena'; tabId?: number | null }
   | { type: 'agentlink:ui:focusArenaTab' }
-  | { type: 'agentlink:ui:dispatchTask'; projectId: string; taskId: string }
+  /** Look for work right now instead of at the next scheduled check. */
+  | { type: 'agentlink:ui:wake' }
   /**
-   * Fallback for when the adapter cannot type into Arena: the task is recorded as sent and the exact prompt is
-   * returned so the user can paste it into Arena themselves. AgentLink then watches the tab for the reply.
+   * Recovery tool, never part of the normal flow: read what Arena has written
+   * for a task right now and hand it over, without waiting for it to settle.
    */
-  | { type: 'agentlink:ui:manualSend'; projectId: string; taskId: string }
-  | { type: 'agentlink:ui:captureResponse'; projectId: string; taskId: string }
-  /** Re-attach the reply watcher to a task that is already waiting for Arena (for example after a browser restart). */
-  | { type: 'agentlink:ui:resumeWatch'; projectId: string; taskId: string }
-  /** Stop watching Arena for a task (it was cancelled, or the session was stopped). */
-  | { type: 'agentlink:ui:cancelExecution'; projectId: string; taskId: string }
-  | { type: 'agentlink:ui:getExecutionStatus' };
-
-export interface ManualSendResult {
-  prompt: string;
-  watching: boolean;
-}
+  | { type: 'agentlink:ui:captureResponse'; projectId: string; taskId: string };
 
 export type UiResult<T> = { ok: true; value: T } | { ok: false; error: string };
-
-/** Background → UI broadcast. */
-export interface ExecutionStatusBroadcast {
-  type: 'agentlink:bg:execution';
-  status: ArenaExecutionStatus;
-}

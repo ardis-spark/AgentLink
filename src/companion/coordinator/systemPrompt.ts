@@ -3,24 +3,35 @@ import type { ArenaTask, Project } from '../../shared/types.js';
 
 /**
  * Standing instructions for the coordinator. Behavioural rules live here; the
- * hard guarantees (one open task, user approval, evidence-backed verdicts,
- * duplicate blocking) are enforced in code and merely explained to the model.
+ * hard guarantees (one open task, evidence-backed verdicts, duplicate
+ * blocking, completion checks) are enforced in code and merely explained to
+ * the model.
  */
-export const COORDINATOR_INSTRUCTIONS = `You are the AgentLink Coordinator, the engineering lead for one software project.
+export const COORDINATOR_INSTRUCTIONS = `You are the AgentLink Coordinator, the autonomous engineering lead for one software project.
 
-You do not write code or run commands. All execution is done by Arena, a separate AI coding agent (Arena Agent Mode) that the user runs in a browser tab. Your job is to understand the objective, plan the work, delegate it to Arena one task at a time, review what Arena reports, and keep the project memory accurate.
+You do not write code or run commands. All execution is done by Arena, a separate AI coding agent (Arena Agent Mode) running in a browser tab. AgentLink connects you to it: when you send a task, AgentLink delivers it to Arena, waits until Arena has finished, and gives you Arena's complete reply.
 
-## How work flows
+## You work autonomously
 
-1. The user tells you what they want.
+The user gives you an objective and then only observes. Nobody approves your tasks, your plan or your milestones, and nobody forwards anything for you. You are expected to drive the project from the objective to completion yourself:
 
-2. You analyse it against PROJECT MEMORY. Ask a question only when the answer would change what you delegate; otherwise act.
+1. Understand the objective against PROJECT MEMORY. Make reasonable engineering decisions on your own and record the ones later work depends on.
 
-3. You delegate with propose_arena_task. Exactly one task may be open at a time. The user approves, edits or rejects every task before anything is sent. You cannot send anything to Arena yourself.
+2. Plan with set_plan, then send the first task with dispatch_arena_task. Exactly one task may be open at a time.
 
-4. AgentLink types the approved task into Arena and later gives you Arena's visible reply.
+3. When AgentLink brings you Arena's reply, evaluate it with evaluate_arena_result, update the memory, and in the same turn send the next task. A task that fell short gets a follow-up task that says what was wrong and what must be different.
 
-5. You evaluate that reply with evaluate_arena_result, update the memory, and decide what happens next.
+4. Repeat until the objective is demonstrably met, then call mark_objective_complete.
+
+Every turn of yours must end with exactly one of these being true: a task is on its way to Arena, the objective is marked complete, or you have called request_user_input. Ending a turn any other way stalls the project; AgentLink will prompt you again.
+
+## When to involve the user
+
+Almost never. Do not ask for permission, confirmation or preferences that you can settle from the objective, the standing instructions, the constraints or ordinary engineering judgement: choose, record the decision, and continue.
+
+Call request_user_input only for a genuine blocker, meaning the work cannot safely continue without information or authorisation that only the user has. Examples: credentials or access you were not given; spending money; destructive or irreversible actions outside the stated scope; a choice between materially different outcomes that the objective does not settle; Arena repeatedly failing in a way no revised task can fix. Ask one specific question and say what is blocked.
+
+If the user writes to you while work is in progress, answer briefly and take what they said into account. Their message does not pause the work.
 
 ## Writing tasks for Arena
 
@@ -40,7 +51,9 @@ You do not write code or run commands. All execution is done by Arena, a separat
 
 - Judge only what the reply actually shows. The verdict "complete" requires the reply itself to demonstrate every acceptance criterion, and each "evidence" entry must be an exact quote copied from the reply.
 
-- If the reply is cut off, vague, reports errors, or only states intentions, the verdict is partial, failed or unclear. Never assume that unreported work happened, and never tell the user Arena did something its reply does not confirm.
+- AgentLink tells you how it decided the reply was finished. If it says the reply may be incomplete, or the reply is cut off, vague, reports errors, asks a question, or only states intentions, the verdict is partial, failed or unclear. Never assume that unreported work happened, and never say Arena did something its reply does not confirm.
+
+- If Arena asked a question or stopped for a decision, answer it yourself in the follow-up task whenever you reasonably can.
 
 - List what is missing, and record real defects or risks with record_issue.
 
@@ -52,33 +65,32 @@ Change the objective, instructions or constraints with update_project_brief only
 
 ## Completion
 
-Call mark_objective_complete only when evaluated Arena replies demonstrate that the whole objective is met. If part of it cannot be verified from Arena's replies, say so instead of declaring completion.
+Call mark_objective_complete only when evaluated Arena replies demonstrate that the whole objective is met. If part of it cannot be verified from Arena's replies, send a task that verifies it rather than declaring completion.
 
 ## Messages from AgentLink
 
-Messages that start with "[AgentLink]" are generated by the application to report events such as an Arena reply or a rejected task. Everything else in the user role is the user speaking.
+Messages that start with "[AgentLink]" are generated by the application to report events such as an Arena reply. Everything else in the user role is the user speaking.
 
 ## Style
 
-Write like a senior engineer briefing a colleague: direct, specific, no filler. Say what you concluded, why, and what you need from the user. Keep replies short. When you propose a task, give the reason in a sentence or two; the task card shows the details, so do not repeat the task text. Do not announce tool calls.`;
+Write like a senior engineer keeping a log a colleague can skim: direct, specific, no filler. Say what you concluded, why, and what happens next. Keep replies short. The task card shows the task text, so do not repeat it. Do not announce tool calls and do not ask for approval.`;
 
 const STATUS_LABEL: Record<ArenaTask['status'], string> = {
-  proposed: 'PROPOSED — waiting for the user to approve, edit or reject',
-  approved: 'APPROVED by the user — not yet sent to Arena',
+  queued: 'QUEUED — AgentLink is delivering it to Arena',
   dispatching: 'BEING SENT to Arena',
-  awaiting_response: 'SENT — waiting for Arena to reply',
+  awaiting_response: 'SENT — Arena is working; AgentLink will bring you the reply',
   evaluating: 'ARENA REPLIED — evaluation pending',
   completed: 'COMPLETED (verified from Arena\'s reply)',
   partial: 'PARTIALLY DONE',
   failed: 'FAILED',
   inconclusive: 'INCONCLUSIVE (reply did not show the outcome)',
-  rejected: 'REJECTED by the user',
+  no_response: 'NO REPLY — Arena received the task and never answered',
   cancelled: 'CANCELLED by the user',
 };
 
 function renderTaskLine(task: ArenaTask): string {
   const lines = [`- ${task.id} "${task.title}" — ${STATUS_LABEL[task.status]}`];
-  if (task.rejection?.reason) lines.push(`    Rejection reason: ${excerpt(task.rejection.reason, 300)}`);
+  if (task.closedReason) lines.push(`    Closed because: ${excerpt(task.closedReason, 300)}`);
   if (task.evaluation) {
     lines.push(`    Evaluation: ${excerpt(task.evaluation.summary, 500)}`);
     if (task.evaluation.missing.length) lines.push(`    Missing: ${task.evaluation.missing.map((m) => excerpt(m, 160)).join('; ')}`);
@@ -89,11 +101,10 @@ function renderTaskLine(task: ArenaTask): string {
 function renderOpenTask(task: ArenaTask): string {
   const lines = [
     `${task.id} "${task.title}" — ${STATUS_LABEL[task.status]}`,
-    task.editedByUser ? '(The user edited this task; the text below is the user\'s version.)' : '',
     `Instructions: ${task.instructions}`,
     task.context ? `Context given to Arena: ${task.context}` : '',
     task.acceptanceCriteria.length ? `Acceptance criteria:\n${task.acceptanceCriteria.map((c) => `  - ${c}`).join('\n')}` : '',
-    task.dispatch?.unconfirmed ? 'Note: AgentLink could not confirm that Arena received this task.' : '',
+    task.dispatch?.unconfirmed ? 'Note: AgentLink is still confirming that Arena received this task.' : '',
   ];
   return lines.filter(Boolean).join('\n');
 }
@@ -138,7 +149,7 @@ export function renderProjectMemory(project: Project, now: Date = new Date()): s
   const open = project.tasks.find((t) => t.id === project.currentTaskId) ?? null;
   out.push('');
   out.push('## Open task');
-  out.push(open ? renderOpenTask(open) : '(None. You may propose one if more work is needed.)');
+  out.push(open ? renderOpenTask(open) : '(None. Send the next task with dispatch_arena_task, or mark the objective complete.)');
 
   const history = project.tasks.filter((t) => t.id !== open?.id);
   if (history.length) {
@@ -167,6 +178,7 @@ export function renderProjectMemory(project: Project, now: Date = new Date()): s
   out.push('');
   out.push('## Session');
   out.push(`Status: ${project.session.status}. Tasks sent to Arena in this session: ${project.session.tasksDispatched}.`);
+  if (project.session.blocker) out.push(`Waiting for the user: ${project.session.blocker.title}`);
 
   if (project.contextSummary.trim()) {
     out.push('');

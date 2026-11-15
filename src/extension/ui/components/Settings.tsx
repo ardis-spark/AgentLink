@@ -217,7 +217,7 @@ function GeminiSection({ state }: { state: WorkspaceState }): VNode {
 const SELECTOR_FIELDS: { key: 'composerSelector' | 'sendButtonSelector' | 'responseSelector' | 'busySelector'; label: string; hint: string }[] = [
   { key: 'composerSelector', label: 'Message box', hint: 'The field you type into.' },
   { key: 'sendButtonSelector', label: 'Send button', hint: 'Leave empty to send with Enter when no button is found.' },
-  { key: 'responseSelector', label: 'Arena replies', hint: 'Matches each reply; the last match is read.' },
+  { key: 'responseSelector', label: 'Arena replies', hint: 'Matches each reply; AgentLink reads the ones that follow the task it sent.' },
   { key: 'busySelector', label: 'Working indicator', hint: 'Something that exists only while Arena is still working, such as a Stop button.' },
 ];
 
@@ -282,11 +282,11 @@ function AdapterForm({ state }: { state: WorkspaceState }): VNode {
             value={settleSeconds}
             onInput={(e) => setDraft({ ...draft, settleMs: (Number((e.currentTarget as HTMLInputElement).value) || 0) * 1000 })}
           />
-          <p class="field__hint">How long the page must stop changing before a reply counts as finished.</p>
+          <p class="field__hint">Arena ends each report with a completion line. When that line is missing, the reply counts as finished after the page has stopped changing for this long.</p>
         </div>
         <div class="field">
           <label class="label" for="adapter-wait">
-            Give up after, minutes
+            Longest silence, minutes
           </label>
           <input
             id="adapter-wait"
@@ -297,7 +297,7 @@ function AdapterForm({ state }: { state: WorkspaceState }): VNode {
             value={waitMinutes}
             onInput={(e) => setDraft({ ...draft, maxWaitMs: (Number((e.currentTarget as HTMLInputElement).value) || 0) * 60_000 })}
           />
-          <p class="field__hint">You can still capture the reply by hand afterwards.</p>
+          <p class="field__hint">If Arena still shows that it is working but nothing has changed for this long, AgentLink hands Gemini what is there, marked as possibly incomplete.</p>
         </div>
       </div>
       <div class="button-row">

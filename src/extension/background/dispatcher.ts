@@ -1,15 +1,14 @@
-import type { ArenaTask } from '../../shared/types.js';
+import type { RelayWorkItem } from '../../shared/api.js';
+import { digestOf } from '../../shared/text.js';
+import type { ArenaCompletion, ArenaTask, RelayPhase } from '../../shared/types.js';
 import type {
   ArenaAdapterConfig,
   ArenaConnectionTest,
-  ArenaExecutionPhase,
-  ArenaExecutionStatus,
   ArenaPageStatus,
   ArenaTabInfo,
   CaptureResult,
-  ContentEvent,
   ContentRequest,
-  ManualSendResult,
+  ProbeResult,
   SubmitPromptResult,
 } from '../../shared/messages.js';
 import { CompanionError, type CompanionClient } from '../lib/companionClient.js';
@@ -37,25 +36,68 @@ export interface TabsPort {
 
 export type DispatcherClient = Pick<
   CompanionClient,
-  'getTask' | 'claimDispatch' | 'confirmDispatch' | 'failDispatch' | 'recordArenaResponse'
+  'getTask' | 'claimDispatch' | 'confirmDispatch' | 'failDispatch' | 'resetDispatch' | 'recordArenaResponse' | 'recordNoResponse' | 'relayWork' | 'reportRelay'
 >;
+
+/** How patient the relay is. All of it can be shortened in tests. */
+export interface RelayTiming {
+  /** Quiet time required when the reply already ends with the completion line. */
+  markerSettleMs: number;
+  /** How long a task whose delivery is in doubt is looked for before it is sent again. */
+  verifyMs: number;
+  /** Arena has the task, is not working, and has written nothing: after this long the task is closed as "no reply". */
+  noReplyMs: number;
+  /** A delivery nobody finished (the browser restarted mid-way) is taken over after this long. */
+  staleClaimMs: number;
+  /** A gap between two looks at the page longer than this means time passed unobserved (sleep, suspended browser). */
+  observationGapMs: number;
+  /** Waits between attempts to type a task that Arena did not accept. */
+  retryBackoffMs: readonly number[];
+  /** Progress is reported to the companion no more often than this. */
+  reportMs: number;
+  /** How long a sent task may be missing from every Arena tab before the user is asked to open its conversation. */
+  missingAttentionMs: number;
+}
+
+export const DEFAULT_RELAY_TIMING: RelayTiming = {
+  markerSettleMs: 3_000,
+  verifyMs: 30_000,
+  noReplyMs: 5 * 60_000,
+  staleClaimMs: 45_000,
+  observationGapMs: 30_000,
+  retryBackoffMs: [3_000, 10_000, 30_000, 60_000],
+  reportMs: 5_000,
+  missingAttentionMs: 20_000,
+};
 
 export interface DispatcherDeps {
   tabs: TabsPort;
   client: DispatcherClient;
   getSettings: () => Promise<ExtensionSettings>;
   saveSettings: (patch: Partial<ExtensionSettings>) => Promise<ExtensionSettings>;
-  broadcast: (status: ArenaExecutionStatus) => void;
-  /** Delay between delivery retries; shortened in tests. */
-  retryDelayMs?: number;
+  timing?: Partial<RelayTiming>;
+  now?: () => number;
 }
 
-interface Execution {
-  status: ArenaExecutionStatus;
+/** What the relay remembers about the task it is carrying. All of it can be rebuilt from the companion and the page. */
+interface Tracking {
+  dispatchId: string | null;
   tabId: number | null;
-  prompt: string;
-  /** A captured reply that has not reached the companion yet. */
-  pendingText: string | null;
+  /** When the task's message was first seen in the page. */
+  foundAt: number | null;
+  lastSeenAt: number;
+  lastDigest: string;
+  /** When the reply text last changed (as far as it was observed). */
+  lastChangeAt: number;
+  sawBusy: boolean;
+  missingSince: number | null;
+  /** A reply that was read in full and has not been accepted by the companion yet. It is retried until it is. */
+  pending: { text: string; completion: ArenaCompletion } | null;
+  failures: number;
+  nextAttemptAt: number;
+  lastReportKey: string;
+  lastReportAt: number;
+  lastReportChars: number;
 }
 
 /** An error whose message is safe and useful to show to the user as-is. */
@@ -66,22 +108,55 @@ export class DispatchError extends Error {
   }
 }
 
+export type RelayLinkState = 'starting' | 'online' | 'offline' | 'unpaired' | 'unauthorized' | 'error';
+
 const key = (projectId: string, taskId: string): string => `${projectId}/${taskId}`;
-const WATCHING: readonly ArenaExecutionPhase[] = ['submitted', 'generating', 'settling', 'needs_manual_send'];
+/** Refusals that mean the companion has moved on; repeating the request cannot succeed. */
+const FINAL_REFUSALS: readonly string[] = ['response_already_recorded', 'invalid_state', 'stale_dispatch', 'task_not_found', 'project_not_found', 'invalid_request'];
+
+function minutes(ms: number): string {
+  const value = Math.max(1, Math.round(ms / 60_000));
+  return `${value} minute${value === 1 ? '' : 's'}`;
+}
 
 /**
- * Carries an approved task to Arena and brings the reply back.
+ * The relay between the companion and Arena. It needs no one to press
+ * anything: every few seconds it asks the companion what is outstanding and
+ * moves each task one step along.
  *
- * The companion is the authority on what may be sent: a task is claimed from
- * it before anything is typed, and the claim succeeds only once. The
- * dispatcher reports back exactly what happened — confirmed, definitely not
- * sent, or unknown — and never re-sends on its own.
+ *  - A queued task is typed into Arena. The companion hands a task out once
+ *    per attempt, and the page is checked first, so it is never typed twice.
+ *  - A task whose delivery is in doubt is looked for in the page. Found: the
+ *    delivery is confirmed. Not there: it goes back to the queue.
+ *  - A sent task is watched by asking the page for a snapshot each time. No
+ *    state lives in the page, so reloads, navigation, throttled background
+ *    tabs and a restarted browser cannot lose the reply; any Arena tab that
+ *    shows the task is used.
+ *  - A finished reply is read in full, checked against the snapshot that
+ *    was judged finished, and handed to the companion — again and again
+ *    until the companion has it.
+ *  - Nothing is ever reported as done without a reply: a task Arena never
+ *    answered is closed as "no reply", and every wait that depends on the
+ *    user is reported with the reason.
  */
 export class ArenaDispatcher {
-  private readonly executions = new Map<string, Execution>();
-  private readonly inFlight = new Set<string>();
+  private readonly trackings = new Map<string, Tracking>();
+  private readonly timing: RelayTiming;
+  private ticking: Promise<void> | null = null;
+  private linkState: RelayLinkState = 'starting';
 
-  constructor(private readonly deps: DispatcherDeps) {}
+  constructor(private readonly deps: DispatcherDeps) {
+    this.timing = { ...DEFAULT_RELAY_TIMING, ...deps.timing };
+  }
+
+  private now(): number {
+    return this.deps.now ? this.deps.now() : Date.now();
+  }
+
+  /** Whether the relay can reach the companion. */
+  link(): RelayLinkState {
+    return this.linkState;
+  }
 
   // ------------------------------------------------------------------ tabs ---
 
@@ -104,7 +179,7 @@ export class ArenaDispatcher {
     } catch {
       // Reported below.
     }
-    throw new DispatchError('AgentLink could not reach the Arena tab. Reload that tab and try again.');
+    throw new DispatchError('AgentLink could not reach the Arena tab. Reload that tab; AgentLink continues by itself.');
   }
 
   async listTabs(): Promise<ArenaTabInfo[]> {
@@ -142,19 +217,27 @@ export class ArenaDispatcher {
     const preferred = settings.preferredTab;
     if (preferred) {
       const same = tabs.find((t) => t.id === preferred.tabId);
-      if (same) return same;
+      if (same) return this.rememberTab(settings, same);
       // Tab ids change when the browser restarts; the same conversation address identifies the tab again.
       const byUrl = tabs.filter((t) => t.url === preferred.url);
-      if (byUrl.length === 1 && byUrl[0]) {
-        await this.deps.saveSettings({ preferredTab: { tabId: byUrl[0].id, url: byUrl[0].url, title: byUrl[0].title } });
-        return byUrl[0];
-      }
-      if (tabs.length === 0) throw new DispatchError('Your preferred Arena tab is closed and no other Arena tab is open. Open Arena Agent Mode in a tab.');
-      throw new DispatchError('Your preferred Arena tab is no longer open. Choose which Arena tab AgentLink should use.');
+      if (byUrl.length === 1 && byUrl[0]) return this.rememberTab(settings, byUrl[0]);
+      // Arena also changes a conversation's address as it goes. With one Arena tab open there is nothing to confuse.
+      if (tabs.length === 1 && tabs[0]) return this.rememberTab(settings, tabs[0]);
+      if (tabs.length === 0) throw new DispatchError('The Arena tab AgentLink was using is closed and no other Arena tab is open. Open Arena Agent Mode in a tab; AgentLink continues by itself.');
+      throw new DispatchError('The Arena tab AgentLink was using is no longer open, and several others are. Choose which one to use in Settings → Arena (or close the others).');
     }
-    if (tabs.length === 0) throw new DispatchError('No Arena tab is open. Open Arena Agent Mode in a tab, then send the task.');
-    if (tabs.length > 1) throw new DispatchError(`${tabs.length} Arena tabs are open. Choose which one AgentLink should use.`);
+    if (tabs.length === 0) throw new DispatchError('No Arena tab is open. Open Arena Agent Mode in a tab; AgentLink sends the task as soon as it is there.');
+    if (tabs.length > 1) throw new DispatchError(`${tabs.length} Arena tabs are open. Choose which one AgentLink should use in Settings → Arena (or close the others).`);
     return tabs[0] as BrowserTab;
+  }
+
+  /** Keeps the remembered tab current, so it is found again after a browser restart or a changed address. */
+  private async rememberTab(settings: ExtensionSettings, tab: BrowserTab): Promise<BrowserTab> {
+    const known = settings.preferredTab;
+    if (!known || known.tabId !== tab.id || known.url !== tab.url) {
+      await this.deps.saveSettings({ preferredTab: { tabId: tab.id, url: tab.url, title: tab.title } }).catch(() => undefined);
+    }
+    return tab;
   }
 
   async focusTarget(): Promise<void> {
@@ -219,300 +302,452 @@ export class ArenaDispatcher {
     return { ok, tab: info, checks, message: ok ? (page.busy ? 'Arena is reachable, but busy right now.' : 'Arena is reachable and ready.') : (failed?.detail ?? 'Arena is not ready.') };
   }
 
-  // --------------------------------------------------------------- statuses ---
+  // ------------------------------------------------------------- the loop ---
 
-  statuses(): ArenaExecutionStatus[] {
-    return Array.from(this.executions.values(), (e) => e.status);
+  /**
+   * One pass over everything outstanding. Safe to call as often as wanted:
+   * passes never overlap, and each one starts from what the companion and
+   * the page say now, not from what an earlier pass assumed.
+   */
+  tick(): Promise<void> {
+    if (!this.ticking) {
+      this.ticking = this.pass().finally(() => {
+        this.ticking = null;
+      });
+    }
+    return this.ticking;
   }
 
-  private setStatus(projectId: string, taskId: string, patch: Partial<ArenaExecutionStatus> & { phase: ArenaExecutionPhase; message: string }, extra: Partial<Omit<Execution, 'status'>> = {}): Execution {
-    const id = key(projectId, taskId);
-    const previous = this.executions.get(id);
-    const status: ArenaExecutionStatus = {
-      projectId,
-      taskId,
-      dispatchId: previous?.status.dispatchId ?? null,
-      chars: previous?.status.chars ?? 0,
-      ...patch,
-      updatedAt: Date.now(),
-    };
-    const execution: Execution = {
-      tabId: previous?.tabId ?? null,
-      prompt: previous?.prompt ?? '',
-      pendingText: previous?.pendingText ?? null,
-      ...extra,
-      status,
-    };
-    this.executions.set(id, execution);
-    this.deps.broadcast(status);
-    return execution;
-  }
-
-  private async retry<T>(work: () => Promise<T>, attempts = 4): Promise<T> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+  private async pass(): Promise<void> {
+    let items: RelayWorkItem[];
+    try {
+      items = (await this.deps.client.relayWork()).items;
+      this.linkState = 'online';
+    } catch (error) {
+      const code = error instanceof CompanionError ? error.code : 'error';
+      this.linkState = code === 'offline' || code === 'unpaired' || code === 'unauthorized' ? code : 'error';
+      // Nothing is forgotten: replies that were already read stay in memory and go out when the companion is back.
+      return;
+    }
+    const live = new Set<string>();
+    for (const item of items) {
+      live.add(key(item.projectId, item.task.id));
       try {
-        return await work();
+        await this.step(item);
       } catch (error) {
-        lastError = error;
-        // Only an unreachable companion is worth retrying; a refusal is final.
-        if (!(error instanceof CompanionError) || error.code !== 'offline') throw error;
-        await new Promise((resolve) => setTimeout(resolve, (this.deps.retryDelayMs ?? 1_500) * (attempt + 1)));
+        // One task failing a step must not stop the others. A refusal from the companion means the task moved
+        // on meanwhile; the next pass starts from the new state either way.
+        if (!(error instanceof CompanionError)) {
+          await this.report(item, 'waiting_for_arena', error instanceof Error ? error.message : 'The relay hit an unexpected problem and is trying again.', false, 0);
+        }
       }
     }
-    throw lastError;
+    for (const id of Array.from(this.trackings.keys())) {
+      if (!live.has(id)) this.trackings.delete(id);
+    }
   }
 
-  // --------------------------------------------------------------- dispatch ---
+  private step(item: RelayWorkItem): Promise<void> {
+    switch (item.task.status) {
+      case 'queued':
+        return this.deliver(item);
+      case 'dispatching':
+        return this.adopt(item);
+      case 'awaiting_response':
+        return this.watch(item);
+      default:
+        return Promise.resolve();
+    }
+  }
 
-  /** Sends an approved task to Arena. Resolves once Arena has accepted it; rejects with a user-facing reason otherwise. */
-  async dispatch(projectId: string, taskId: string): Promise<ArenaExecutionStatus> {
-    const id = key(projectId, taskId);
-    if (this.inFlight.has(id)) throw new DispatchError('This task is already being sent.');
-    this.inFlight.add(id);
+  private tracking(item: RelayWorkItem, dispatchId: string | null): Tracking {
+    const id = key(item.projectId, item.task.id);
+    let tracking = this.trackings.get(id);
+    if (!tracking || (dispatchId !== null && tracking.dispatchId !== null && tracking.dispatchId !== dispatchId)) {
+      const at = this.now();
+      tracking = {
+        dispatchId,
+        tabId: tracking?.tabId ?? null,
+        foundAt: null,
+        lastSeenAt: at,
+        lastDigest: '',
+        lastChangeAt: at,
+        sawBusy: false,
+        missingSince: null,
+        pending: null,
+        failures: tracking?.failures ?? 0,
+        nextAttemptAt: tracking?.nextAttemptAt ?? 0,
+        lastReportKey: '',
+        lastReportAt: 0,
+        lastReportChars: -1,
+      };
+      this.trackings.set(id, tracking);
+    }
+    if (dispatchId !== null) tracking.dispatchId = dispatchId;
+    return tracking;
+  }
+
+  /** Tells the companion (and through it the user) where the task is. Repeats of the same news are dropped. */
+  private async report(item: RelayWorkItem, phase: RelayPhase, message: string, attention: boolean, chars: number): Promise<void> {
+    const tracking = this.tracking(item, null);
+    const at = this.now();
+    const reportKey = `${phase}|${attention ? 1 : 0}|${message}`;
+    if (reportKey === tracking.lastReportKey && (chars === tracking.lastReportChars || at - tracking.lastReportAt < this.timing.reportMs)) return;
+    tracking.lastReportKey = reportKey;
+    tracking.lastReportAt = at;
+    tracking.lastReportChars = chars;
     try {
-      const settings = await this.deps.getSettings();
-      // Everything that can be checked is checked before the task is claimed, so a failed check costs nothing.
-      const tab = await this.resolveTarget(settings);
-      const page = await this.ping(tab.id, settings.adapter);
-      if (!page.composerFound) throw new DispatchError("Arena's message box was not found in the selected tab. Open an Arena Agent Mode conversation there.");
-      if (page.agentMode === false) throw new DispatchError('The selected Arena tab is not in Agent Mode. Switch it to Agent Mode, then send the task.');
-      if (page.busy) throw new DispatchError('Arena is still working on a previous request in the selected tab. Wait for it to finish.');
+      await this.deps.client.reportRelay(item.projectId, item.task.id, { dispatchId: tracking.dispatchId, phase, message, attention, chars });
+    } catch {
+      // Status is best effort; force the next one through.
+      tracking.lastReportKey = '';
+    }
+  }
 
-      const claim = await this.deps.client.claimDispatch(projectId, taskId, { tabId: tab.id, tabUrl: tab.url });
-      this.setStatus(projectId, taskId, { phase: 'sending', message: 'Typing the task into Arena…', dispatchId: claim.dispatchId, chars: 0 }, { tabId: tab.id, prompt: claim.prompt, pendingText: null });
+  // -------------------------------------------------------------- delivery ---
 
-      let result: SubmitPromptResult;
-      try {
-        const answer = (await this.deps.tabs.send(tab.id, {
-          type: 'agentlink:arena:submit',
-          projectId,
-          taskId,
-          dispatchId: claim.dispatchId,
-          prompt: claim.prompt,
-          config: settings.adapter,
-        })) as SubmitPromptResult | undefined;
-        result = answer && typeof answer.ok === 'boolean' ? answer : { ok: false, submitted: 'unknown', error: 'The Arena tab gave no answer while the task was being sent. Check the tab before sending anything again.' };
-      } catch {
-        result = { ok: false, submitted: 'unknown', error: 'The Arena tab was closed or reloaded while the task was being sent. Check the tab before sending anything again.' };
-      }
+  /** Types a queued task into Arena. */
+  private async deliver(item: RelayWorkItem): Promise<void> {
+    const { projectId, task } = item;
+    const tracking = this.tracking(item, null);
+    if (this.now() < tracking.nextAttemptAt) return;
+    const settings = await this.deps.getSettings();
 
-      if (!result.ok) {
-        const failure = result;
-        await this.retry(() => this.deps.client.failDispatch(projectId, taskId, { dispatchId: claim.dispatchId, error: failure.error, submitted: failure.submitted }));
-        this.setStatus(projectId, taskId, { phase: 'error', message: failure.error });
-        throw new DispatchError(failure.error);
-      }
-
-      await this.retry(() => this.deps.client.confirmDispatch(projectId, taskId, claim.dispatchId));
-      const execution = this.setStatus(projectId, taskId, { phase: 'submitted', message: 'Arena accepted the task. Waiting for its reply…' });
-      await this.startWatch(execution, settings.adapter);
-      return this.executions.get(id)?.status ?? execution.status;
+    // Everything that can be checked is checked before the task is claimed, so a failed check costs no attempt.
+    let tab: BrowserTab;
+    let page: ArenaPageStatus;
+    try {
+      tab = await this.resolveTarget(settings);
+      page = await this.ping(tab.id, settings.adapter);
     } catch (error) {
-      if (error instanceof DispatchError) throw error;
-      throw new DispatchError(error instanceof Error ? error.message : 'The task could not be sent.');
-    } finally {
-      this.inFlight.delete(id);
+      await this.report(item, 'waiting_for_arena', error instanceof Error ? error.message : 'No Arena tab could be used.', true, 0);
+      return;
+    }
+    if (!page.composerFound) {
+      await this.report(item, 'waiting_for_arena', "Arena's message box was not found in the selected tab. Open an Arena Agent Mode conversation there; AgentLink sends the task as soon as it can.", true, 0);
+      return;
+    }
+    if (page.agentMode === false) {
+      await this.report(item, 'waiting_for_arena', 'The selected Arena tab is not in Agent Mode. Switch it to Agent Mode; AgentLink sends the task as soon as it is.', true, 0);
+      return;
+    }
+    if (page.busy) {
+      await this.report(item, 'waiting_for_arena', 'Arena is still working on a previous request. The task is sent as soon as Arena is free.', false, 0);
+      return;
+    }
+    if (page.composerDraft && !page.composerDraft.includes(`Task ${task.id}:`)) {
+      await this.report(item, 'waiting_for_arena', "Arena's message box contains a draft. Send or clear it; AgentLink does not overwrite it and sends the task as soon as the box is empty.", true, 0);
+      return;
+    }
+
+    let claim: Awaited<ReturnType<DispatcherClient['claimDispatch']>>;
+    try {
+      claim = await this.deps.client.claimDispatch(projectId, task.id, { tabId: tab.id, tabUrl: tab.url });
+    } catch (error) {
+      if (error instanceof CompanionError && error.code === 'offline') throw error;
+      // The companion refused: the task was cancelled, the session stopped, or it explains the block itself.
+      return;
+    }
+    tracking.dispatchId = claim.dispatchId;
+    tracking.tabId = tab.id;
+    const ref = claim.task.dispatch?.ref ?? '';
+    await this.report(item, 'sending', 'Typing the task into Arena…', false, 0);
+
+    let result: SubmitPromptResult;
+    try {
+      const answer = (await this.deps.tabs.send(tab.id, { type: 'agentlink:arena:submit', prompt: claim.prompt, ref, config: settings.adapter })) as SubmitPromptResult | undefined;
+      result = answer && typeof answer.ok === 'boolean' ? answer : { ok: false, submitted: 'unknown', error: 'The Arena tab gave no answer while the task was being sent.' };
+    } catch {
+      result = { ok: false, submitted: 'unknown', error: 'The Arena tab was closed or reloaded while the task was being sent.' };
+    }
+
+    if (result.ok) {
+      // If this confirmation is lost, the task stays "being sent" at the companion and is taken over by `adopt`,
+      // which finds it in the page and confirms it then.
+      await this.deps.client.confirmDispatch(projectId, task.id, claim.dispatchId);
+      // From now on this is the tab the project works in, even if other Arena tabs are opened later.
+      await this.rememberTab(settings, tab);
+      tracking.failures = 0;
+      tracking.nextAttemptAt = 0;
+      tracking.foundAt = this.now();
+      tracking.lastChangeAt = this.now();
+      tracking.lastSeenAt = this.now();
+      await this.report(item, 'submitted', 'Arena accepted the task. Waiting for it to start…', false, 0);
+      return;
+    }
+
+    await this.deps.client.failDispatch(projectId, task.id, { dispatchId: claim.dispatchId, error: result.error, submitted: result.submitted });
+    if (result.submitted === false) {
+      const waits = this.timing.retryBackoffMs;
+      const wait = waits[Math.min(tracking.failures, waits.length - 1)] ?? 0;
+      tracking.failures += 1;
+      tracking.nextAttemptAt = this.now() + wait;
+      await this.report(item, 'waiting_for_arena', `${result.error} Trying again shortly.`, tracking.failures >= 2, 0);
+    } else {
+      await this.report(item, 'verifying', `${result.error} Checking whether Arena received the task before anything is sent again.`, false, 0);
     }
   }
 
   /**
-   * The manual route: the task is recorded as sent and its exact text is handed back for the user to paste into
-   * Arena. Used when the adapter cannot operate Arena's message box.
+   * A task is marked "being sent", but this relay is not sending it: whoever
+   * was (an earlier run of the browser or the extension) is gone. Its
+   * delivery is treated as in doubt, which makes `watch` look for it in the
+   * page before anything is typed again.
    */
-  async manualSend(projectId: string, taskId: string): Promise<ManualSendResult> {
-    const id = key(projectId, taskId);
-    if (this.inFlight.has(id)) throw new DispatchError('This task is already being sent.');
-    this.inFlight.add(id);
-    try {
-      const settings = await this.deps.getSettings();
-      let tab: BrowserTab | null = null;
-      try {
-        tab = await this.resolveTarget(settings);
-      } catch {
-        tab = null; // Without a tab the reply simply has to be pasted back by hand.
-      }
-      const claim = await this.deps.client.claimDispatch(projectId, taskId, { tabId: tab?.id ?? null, tabUrl: tab?.url ?? null });
-      await this.retry(() => this.deps.client.confirmDispatch(projectId, taskId, claim.dispatchId));
-      const execution = this.setStatus(
-        projectId,
-        taskId,
-        { phase: 'needs_manual_send', message: 'Paste the copied task into Arena and send it. AgentLink is watching for the reply.', dispatchId: claim.dispatchId, chars: 0 },
-        { tabId: tab?.id ?? null, prompt: claim.prompt, pendingText: null },
-      );
-      let watching = false;
-      if (tab) {
-        try {
-          await this.ping(tab.id, settings.adapter);
-          await this.startWatch(execution, settings.adapter, true);
-          watching = true;
-        } catch {
-          watching = false;
-        }
-      }
-      if (!watching) {
-        this.setStatus(projectId, taskId, { phase: 'needs_manual_send', message: 'Paste the copied task into Arena and send it. When Arena has answered, paste its reply here.' });
-      }
-      return { prompt: claim.prompt, watching };
-    } catch (error) {
-      if (error instanceof DispatchError) throw error;
-      throw new DispatchError(error instanceof Error ? error.message : 'The task could not be marked as sent.');
-    } finally {
-      this.inFlight.delete(id);
-    }
+  private async adopt(item: RelayWorkItem): Promise<void> {
+    const dispatch = item.task.dispatch;
+    if (!dispatch) return;
+    const age = this.now() - Date.parse(dispatch.claimedAt);
+    if (Number.isFinite(age) && age < this.timing.staleClaimMs) return;
+    await this.deps.client.failDispatch(item.projectId, item.task.id, {
+      dispatchId: dispatch.dispatchId,
+      error: 'The browser or the extension restarted while this task was being sent. Checking the Arena tab for it.',
+      submitted: 'unknown',
+    });
   }
 
-  private async startWatch(execution: Execution, config: ArenaAdapterConfig, keepPhase = false): Promise<void> {
-    const { projectId, taskId, dispatchId } = execution.status;
-    if (execution.tabId === null || !dispatchId) return;
+  // --------------------------------------------------------------- watching ---
+
+  private async probeTab(tabId: number, task: ArenaTask, config: ArenaAdapterConfig): Promise<ProbeResult | null> {
+    const dispatch = task.dispatch;
+    if (!dispatch) return null;
+    const request: ContentRequest = { type: 'agentlink:arena:probe', prompt: dispatch.prompt, ref: dispatch.ref ?? '', config };
+    const ask = async (): Promise<ProbeResult | null> => {
+      const answer = (await this.deps.tabs.send(tabId, request)) as ProbeResult | undefined;
+      return answer && answer.ok === true ? answer : null;
+    };
     try {
-      await this.deps.tabs.send(execution.tabId, { type: 'agentlink:arena:watch', projectId, taskId, dispatchId, prompt: execution.prompt, config });
+      const first = await ask();
+      if (first) return first;
     } catch {
-      if (!keepPhase) {
-        this.setStatus(projectId, taskId, { phase: 'timeout', message: 'The task was sent, but AgentLink lost contact with the Arena tab. Capture the reply when Arena has finished.' });
-      }
-      throw new DispatchError('AgentLink lost contact with the Arena tab.');
+      // No adapter in the tab (it was reloaded, or opened before the extension): load it and ask again.
+    }
+    try {
+      await this.deps.tabs.inject(tabId);
+      return await ask();
+    } catch {
+      return null;
     }
   }
 
-  // ----------------------------------------------------------------- replies ---
-
-  private async taskAwaitingReply(projectId: string, taskId: string): Promise<ArenaTask & { dispatch: NonNullable<ArenaTask['dispatch']> }> {
-    const { task } = await this.deps.client.getTask(projectId, taskId);
-    if (task.status !== 'awaiting_response' || !task.dispatch) {
-      throw new DispatchError(`Task ${taskId} is not waiting for a reply from Arena.`);
-    }
-    return task as ArenaTask & { dispatch: NonNullable<ArenaTask['dispatch']> };
-  }
-
-  /** The tab a sent task lives in: the one it was sent to if that is still open, otherwise the selected tab. */
-  private async tabForTask(projectId: string, taskId: string, task: ArenaTask, settings: ExtensionSettings): Promise<BrowserTab> {
+  /**
+   * Finds the Arena tab that shows this task. The tab it was sent to is asked
+   * first, then the preferred tab, then every other Arena tab: tab ids change
+   * when the browser restarts and Arena changes a conversation's address
+   * after the first message, so neither can be relied on alone.
+   */
+  private async locate(item: RelayWorkItem, tracking: Tracking, settings: ExtensionSettings): Promise<{ tabs: number; reachable: number; tabId: number | null; probe: ProbeResult | null; unsentIn: number | null }> {
     const tabs = await this.deps.tabs.queryArenaTabs();
-    const known = this.executions.get(key(projectId, taskId))?.tabId ?? task.dispatch?.tabId ?? null;
-    const sameTab = tabs.find((t) => t.id === known);
-    if (sameTab) return sameTab;
-    const sameUrl = tabs.filter((t) => t.url === task.dispatch?.tabUrl);
-    if (sameUrl.length === 1 && sameUrl[0]) return sameUrl[0];
-    return this.resolveTarget(settings);
+    const dispatch = item.task.dispatch;
+    const rank = (tab: BrowserTab): number => {
+      if (tab.id === tracking.tabId) return 0;
+      if (tab.id === dispatch?.tabId) return 1;
+      if (dispatch?.tabUrl && tab.url === dispatch.tabUrl) return 2;
+      if (tab.id === settings.preferredTab?.tabId) return 3;
+      return 4;
+    };
+    const ordered = [...tabs].sort((a, b) => rank(a) - rank(b));
+    let reachable = 0;
+    let unsentIn: number | null = null;
+    for (const tab of ordered) {
+      const probe = await this.probeTab(tab.id, item.task, settings.adapter);
+      if (!probe) continue;
+      reachable += 1;
+      if (probe.found) return { tabs: tabs.length, reachable, tabId: tab.id, probe, unsentIn };
+      if (probe.composerHoldsPrompt) unsentIn = tab.id;
+    }
+    return { tabs: tabs.length, reachable, tabId: null, probe: null, unsentIn };
   }
 
-  /** Reads Arena's reply to a sent task right now, at the user's request. */
-  async capture(projectId: string, taskId: string): Promise<ArenaExecutionStatus> {
-    const settings = await this.deps.getSettings();
-    const task = await this.taskAwaitingReply(projectId, taskId);
-    const tab = await this.tabForTask(projectId, taskId, task, settings);
-    await this.ping(tab.id, settings.adapter);
-    let result: CaptureResult | undefined;
-    try {
-      result = (await this.deps.tabs.send(tab.id, { type: 'agentlink:arena:capture', prompt: task.dispatch.prompt, config: settings.adapter })) as CaptureResult | undefined;
-    } catch {
-      throw new DispatchError('AgentLink lost contact with the Arena tab. Reload it and try again.');
+  /** Follows a sent task until its reply is complete, then brings the reply back. */
+  private async watch(item: RelayWorkItem): Promise<void> {
+    const { projectId, task } = item;
+    const dispatch = task.dispatch;
+    if (!dispatch) return;
+    const tracking = this.tracking(item, dispatch.dispatchId);
+    if (tracking.pending) {
+      await this.handOver(item, tracking);
+      return;
     }
-    if (!result || !result.ok) throw new DispatchError(result?.error ?? 'The Arena tab gave no answer.');
+    const settings = await this.deps.getSettings();
+    const config = settings.adapter;
+    const now = this.now();
+    const located = await this.locate(item, tracking, settings);
 
-    await this.deps.tabs.send(tab.id, { type: 'agentlink:arena:cancel', dispatchId: task.dispatch.dispatchId }).catch(() => undefined);
-    const text = result.text;
+    if (!located.probe || located.tabId === null) {
+      tracking.tabId = null;
+      tracking.missingSince ??= now;
+      const missingFor = now - tracking.missingSince;
+      if (dispatch.unconfirmed && located.reachable > 0) {
+        // The page was looked at and the task is not in it. Once that is certain, it is safe to send it again.
+        if (located.unsentIn !== null || missingFor >= this.timing.verifyMs) {
+          const reason =
+            located.unsentIn !== null
+              ? "The task is still sitting in Arena's message box and is not in the conversation, so it was not sent."
+              : `The task did not appear in any open Arena tab within ${Math.round(this.timing.verifyMs / 1000)} seconds, so it was not sent.`;
+          await this.deps.client.resetDispatch(projectId, task.id, { dispatchId: dispatch.dispatchId, reason });
+          this.trackings.delete(key(projectId, task.id));
+          return;
+        }
+        await this.report(item, 'verifying', 'Checking whether Arena received the task before anything is sent again…', false, 0);
+        return;
+      }
+      const where =
+        located.tabs === 0
+          ? `No Arena tab is open. Reopen the Arena conversation that ${task.id} was sent to; AgentLink picks up the reply by itself.`
+          : located.reachable === 0
+            ? 'AgentLink cannot reach the open Arena tab. Reload it; AgentLink picks up the reply by itself.'
+            : `${task.id} was sent, but its conversation is not open in any Arena tab. Open that conversation; AgentLink picks up the reply by itself.`;
+      await this.report(item, 'searching', where, missingFor >= this.timing.missingAttentionMs, 0);
+      return;
+    }
+
+    const probe = located.probe;
+    if (settings.preferredTab?.tabId === tracking.tabId && tracking.tabId !== located.tabId) {
+      // The conversation is open in a different tab now (the browser restarted); follow it there.
+      const moved = (await this.deps.tabs.queryArenaTabs()).find((t) => t.id === located.tabId);
+      if (moved) await this.rememberTab(settings, moved);
+    }
+    tracking.tabId = located.tabId;
+    tracking.missingSince = null;
+    if (dispatch.unconfirmed) {
+      // Found in the page: the delivery is no longer in doubt.
+      await this.deps.client.confirmDispatch(projectId, task.id, dispatch.dispatchId);
+    }
+
+    // Time that passed while nobody looked (a sleeping computer) proves nothing about the reply being finished.
+    const unobserved = now - tracking.lastSeenAt > this.timing.observationGapMs;
+    if (tracking.foundAt === null || unobserved || probe.digest !== tracking.lastDigest) {
+      tracking.foundAt ??= now;
+      tracking.lastDigest = probe.digest;
+      tracking.lastChangeAt = now;
+    }
+    tracking.lastSeenAt = now;
+    if (probe.busy) tracking.sawBusy = true;
+    const quiet = now - tracking.lastChangeAt;
+
+    let completion: ArenaCompletion | null = null;
+    if (probe.chars > 0) {
+      if (probe.marker && quiet >= (probe.busy ? config.settleMs : this.timing.markerSettleMs)) completion = 'marker';
+      // Without the completion line, and on a page that never showed a "working" signal, silence is weaker
+      // evidence that Arena has finished, so a longer quiet period is required.
+      else if (!probe.busy && quiet >= (tracking.sawBusy ? config.settleMs : config.settleMs * 3)) completion = 'quiet';
+      else if (quiet >= config.maxWaitMs) completion = 'stalled';
+    }
+
+    if (completion) {
+      const captured = await this.captureFrom(located.tabId, task, config);
+      if (!captured || !captured.ok || !captured.text) {
+        tracking.lastChangeAt = now;
+        return;
+      }
+      // The text handed over must be the text that was judged finished, not something still moving.
+      if (digestOf(captured.text) !== probe.digest) {
+        tracking.lastDigest = '';
+        tracking.lastChangeAt = now;
+        return;
+      }
+      tracking.pending = { text: captured.text, completion };
+      await this.handOver(item, tracking);
+      return;
+    }
+
+    if (probe.chars === 0) {
+      const waited = now - Math.max(tracking.foundAt ?? now, tracking.lastChangeAt);
+      const limit = probe.busy ? config.maxWaitMs : Math.min(this.timing.noReplyMs, config.maxWaitMs);
+      if (waited >= limit) {
+        const reason = probe.busy
+          ? `Arena showed that it was working for ${minutes(waited)} without writing anything.`
+          : `Arena received the task but had written nothing after ${minutes(waited)} and was not working on it.`;
+        await this.deps.client.recordNoResponse(projectId, task.id, { dispatchId: dispatch.dispatchId, reason });
+        this.trackings.delete(key(projectId, task.id));
+        return;
+      }
+      await this.report(item, probe.busy ? 'generating' : 'submitted', probe.busy ? 'Arena is working…' : 'Arena has the task. Waiting for it to start…', false, 0);
+      return;
+    }
+
+    if (probe.busy && quiet >= Math.min(5 * 60_000, config.maxWaitMs / 2)) {
+      await this.report(
+        item,
+        'stalled',
+        `Arena still shows that it is working, but nothing has changed for ${minutes(quiet)}. If that continues until ${minutes(config.maxWaitMs)} have passed, AgentLink hands over what Arena has written so far, marked as possibly incomplete.`,
+        false,
+        probe.chars,
+      );
+      return;
+    }
+    await this.report(
+      item,
+      probe.busy || quiet < this.timing.markerSettleMs ? 'generating' : 'settling',
+      probe.busy ? 'Arena is working…' : 'Arena has stopped writing. Making sure the reply is complete…',
+      false,
+      probe.chars,
+    );
+  }
+
+  private async captureFrom(tabId: number, task: ArenaTask, config: ArenaAdapterConfig): Promise<CaptureResult | null> {
+    const dispatch = task.dispatch;
+    if (!dispatch) return null;
     try {
-      await this.deps.client.recordArenaResponse(projectId, taskId, { dispatchId: task.dispatch.dispatchId, text, source: 'manual_capture' });
+      const answer = (await this.deps.tabs.send(tabId, { type: 'agentlink:arena:capture', prompt: dispatch.prompt, ref: dispatch.ref ?? '', config })) as CaptureResult | undefined;
+      return answer && typeof answer.ok === 'boolean' ? answer : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Gives a reply that was read in full to the companion. It stays in memory
+   * until the companion has accepted it or has said that it no longer wants
+   * it; an unreachable companion only delays it.
+   */
+  private async handOver(item: RelayWorkItem, tracking: Tracking): Promise<void> {
+    const pending = tracking.pending;
+    if (!pending || !tracking.dispatchId) return;
+    await this.report(item, 'delivering', "Arena's reply was read in full. Handing it to Gemini…", false, pending.text.length);
+    try {
+      await this.deps.client.recordArenaResponse(item.projectId, item.task.id, {
+        dispatchId: tracking.dispatchId,
+        text: pending.text,
+        source: 'auto',
+        completion: pending.completion,
+      });
+      tracking.pending = null;
+    } catch (error) {
+      if (error instanceof CompanionError && FINAL_REFUSALS.includes(error.code)) {
+        // The companion already has a reply for this task, or the task was closed meanwhile.
+        tracking.pending = null;
+        return;
+      }
+      // Anything else (companion stopped, token changed, a server error) is temporary: the next pass tries again.
+      await this.report(item, 'delivering', "Arena's reply was read in full, but the companion did not accept it yet. Trying again…", true, pending.text.length);
+    }
+  }
+
+  // --------------------------------------------------------------- recovery ---
+
+  /**
+   * Recovery tool for a person, never part of the normal flow: hands over
+   * what Arena has written for a task right now, without waiting for it to
+   * settle. The reply is marked as supplied by hand.
+   */
+  async capture(projectId: string, taskId: string): Promise<{ chars: number }> {
+    const settings = await this.deps.getSettings();
+    const { task } = await this.deps.client.getTask(projectId, taskId);
+    if (task.status !== 'awaiting_response' || !task.dispatch) throw new DispatchError(`Task ${taskId} is not waiting for a reply from Arena.`);
+    const item: RelayWorkItem = { projectId, projectName: '', task };
+    const located = await this.locate(item, this.tracking(item, task.dispatch.dispatchId), settings);
+    if (located.tabId === null) throw new DispatchError(`${taskId} was not found in any open Arena tab. Open the conversation it was sent in.`);
+    const captured = await this.captureFrom(located.tabId, task, settings.adapter);
+    if (!captured) throw new DispatchError('AgentLink lost contact with the Arena tab. Reload it and try again.');
+    if (!captured.ok) throw new DispatchError(captured.error);
+    try {
+      await this.deps.client.recordArenaResponse(projectId, taskId, { dispatchId: task.dispatch.dispatchId, text: captured.text, source: 'manual_capture', completion: captured.marker ? 'marker' : 'manual' });
     } catch (error) {
       throw new DispatchError(error instanceof Error ? error.message : 'The reply could not be handed to the companion.');
     }
-    return this.setStatus(projectId, taskId, { phase: 'captured', message: 'Reply captured and handed to Gemini for evaluation.', dispatchId: task.dispatch.dispatchId, chars: text.length }, { tabId: tab.id, prompt: task.dispatch.prompt, pendingText: null }).status;
-  }
-
-  /** Starts watching again for a task that is already waiting (after a browser restart or a reloaded tab). */
-  async resumeWatch(projectId: string, taskId: string): Promise<ArenaExecutionStatus | null> {
-    const existing = this.executions.get(key(projectId, taskId));
-    if (existing && WATCHING.includes(existing.status.phase) && existing.tabId !== null) return existing.status;
-    const settings = await this.deps.getSettings();
-    const task = await this.taskAwaitingReply(projectId, taskId);
-    const tab = await this.tabForTask(projectId, taskId, task, settings);
-    await this.ping(tab.id, settings.adapter);
-    const execution = this.setStatus(
-      projectId,
-      taskId,
-      { phase: 'submitted', message: 'Watching the Arena tab for the reply…', dispatchId: task.dispatch.dispatchId, chars: 0 },
-      { tabId: tab.id, prompt: task.dispatch.prompt, pendingText: null },
-    );
-    await this.startWatch(execution, settings.adapter);
-    return this.executions.get(key(projectId, taskId))?.status ?? null;
-  }
-
-  async cancel(projectId: string, taskId: string): Promise<void> {
-    const id = key(projectId, taskId);
-    const execution = this.executions.get(id);
-    if (!execution) return;
-    this.executions.delete(id);
-    if (execution.tabId !== null) {
-      await this.deps.tabs.send(execution.tabId, { type: 'agentlink:arena:cancel', dispatchId: execution.status.dispatchId }).catch(() => undefined);
-    }
-    this.deps.broadcast({ ...execution.status, phase: 'idle', message: '', updatedAt: Date.now() });
-  }
-
-  /** A watched tab finished loading again: its adapter is new and has to be told what to watch for. */
-  async tabReloaded(tabId: number): Promise<void> {
-    for (const execution of this.executions.values()) {
-      if (execution.tabId !== tabId || !WATCHING.includes(execution.status.phase)) continue;
-      const settings = await this.deps.getSettings();
-      try {
-        await this.ping(tabId, settings.adapter);
-        await this.startWatch(execution, settings.adapter, true);
-      } catch {
-        // startWatch has already recorded the lost contact where appropriate.
-      }
-    }
-  }
-
-  tabClosed(tabId: number): void {
-    for (const execution of this.executions.values()) {
-      if (execution.tabId !== tabId || !WATCHING.includes(execution.status.phase)) continue;
-      const { projectId, taskId } = execution.status;
-      this.setStatus(projectId, taskId, { phase: 'error', message: 'The Arena tab was closed before a reply was captured. Reopen the conversation and capture the reply, or paste it here.' }, { tabId: null });
-    }
-  }
-
-  /** Notifications from the adapter in an Arena tab. */
-  async onContentEvent(event: ContentEvent, senderTabId: number | null): Promise<void> {
-    const execution = this.executions.get(key(event.projectId, event.taskId));
-    // Only the tab and the dispatch this task was actually sent with are listened to.
-    if (!execution || execution.status.dispatchId !== event.dispatchId) return;
-    if (senderTabId !== null && execution.tabId !== null && senderTabId !== execution.tabId) return;
-    const { projectId, taskId } = event;
-
-    if (event.type === 'agentlink:arena:progress') {
-      this.setStatus(projectId, taskId, {
-        phase: event.generating ? 'generating' : 'settling',
-        message: event.generating ? 'Arena is working…' : 'Arena has stopped writing. Making sure the reply is complete…',
-        chars: event.chars,
-      });
-      return;
-    }
-    if (event.type === 'agentlink:arena:timeout') {
-      this.setStatus(projectId, taskId, {
-        phase: 'timeout',
-        message:
-          event.chars > 0
-            ? 'Arena was still working when AgentLink stopped waiting. Capture the reply when it has finished.'
-            : 'AgentLink could not find this task in the Arena tab. If you sent it in another conversation, open that one and capture the reply, or paste it here.',
-        chars: event.chars,
-      });
-      return;
-    }
-    await this.deliver(projectId, taskId, event.dispatchId, event.text);
-  }
-
-  private async deliver(projectId: string, taskId: string, dispatchId: string, text: string): Promise<void> {
-    this.setStatus(projectId, taskId, { phase: 'captured', message: 'Reply captured. Handing it to Gemini…', chars: text.length }, { pendingText: text });
-    try {
-      await this.retry(() => this.deps.client.recordArenaResponse(projectId, taskId, { dispatchId, text, source: 'auto' }), 6);
-      this.setStatus(projectId, taskId, { phase: 'captured', message: 'Reply captured and handed to Gemini for evaluation.', chars: text.length }, { pendingText: null });
-    } catch (error) {
-      if (error instanceof CompanionError && error.code === 'offline') {
-        this.setStatus(projectId, taskId, { phase: 'error', message: 'The reply was captured, but the companion is not running. Start it, then use "Capture reply".', chars: text.length });
-        return;
-      }
-      // The companion refused it (the task was cancelled, or a reply is already recorded): nothing more to do.
-      this.setStatus(projectId, taskId, { phase: 'idle', message: error instanceof Error ? error.message : '', chars: text.length }, { pendingText: null });
-    }
+    this.trackings.delete(key(projectId, taskId));
+    return { chars: captured.text.length };
   }
 }

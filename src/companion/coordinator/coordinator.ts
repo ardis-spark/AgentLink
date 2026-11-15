@@ -7,7 +7,8 @@ import { compactTranscript } from './context.js';
 import { buildSystemInstruction } from './systemPrompt.js';
 import { COORDINATOR_TOOLS, EVALUATION_TOOL, executeTool, type ToolContext } from './tools.js';
 
-export type TurnKind = 'user' | 'evaluation' | 'feedback';
+/** `continue` turns are started by AgentLink itself: the kickoff, reminders, and reports such as "Arena did not reply". */
+export type TurnKind = 'user' | 'evaluation' | 'continue';
 
 export interface TurnInput {
   kind: TurnKind;

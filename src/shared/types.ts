@@ -15,29 +15,60 @@ export type IsoTime = string;
 
 // ---------------------------------------------------------------- session ---
 
-export type SessionStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'completed';
-export type PauseReason = 'user' | 'restart' | 'task_budget';
+/**
+ * idle → running → completed. A running session works on its own.
+ *
+ *  - `paused`:  the user asked AgentLink to hold still.
+ *  - `blocked`: AgentLink cannot continue without the user (see `blocker`).
+ *  - `stopped`: the user ended the session.
+ */
+export type SessionStatus = 'idle' | 'running' | 'paused' | 'blocked' | 'stopped' | 'completed';
+
+/**
+ * Why a session cannot continue on its own:
+ *  - `question`:    the coordinator needs information or authorisation only the user can give.
+ *  - `gemini`:      Gemini cannot be used (no key, key rejected, repeated failures).
+ *  - `arena`:       a task could not be delivered to Arena after several safe attempts.
+ *  - `coordinator`: Gemini kept ending its turn without a next step.
+ *  - `task_budget`: the configured safety limit of tasks per session was reached.
+ */
+export type BlockerKind = 'question' | 'gemini' | 'arena' | 'coordinator' | 'task_budget';
+
+export interface Blocker {
+  kind: BlockerKind;
+  title: string;
+  detail: string;
+  /** Answers the coordinator suggested, when it asked a question. */
+  options: string[];
+  taskId: string | null;
+  at: IsoTime;
+}
 
 export interface SessionState {
   status: SessionStatus;
   startedAt: IsoTime | null;
   updatedAt: IsoTime;
-  pauseReason: PauseReason | null;
+  /** Set exactly while `status` is `blocked`. */
+  blocker: Blocker | null;
   /** Tasks handed to Arena since the session was last started or resumed. */
   tasksDispatched: number;
+  /** Coordinator turns in a row that ended with nothing left in motion. */
+  idleTurns: number;
   note: string | null;
 }
 
 // ------------------------------------------------------------------ tasks ---
 
 /**
- * proposed → approved → dispatching → awaiting_response → evaluating →
+ * queued → dispatching → awaiting_response → evaluating →
  *   completed | partial | failed | inconclusive
- * Side exits: rejected (user declined), cancelled (user stopped it).
+ *
+ * A task is queued the moment the coordinator creates it and is sent to Arena
+ * without anyone approving it. Side exits: `no_response` (Arena received the
+ * task and never answered) and `cancelled` (the user stopped it).
  */
 export type TaskStatus =
-  | 'proposed'
-  | 'approved'
+  | 'queued'
   | 'dispatching'
   | 'awaiting_response'
   | 'evaluating'
@@ -45,16 +76,10 @@ export type TaskStatus =
   | 'partial'
   | 'failed'
   | 'inconclusive'
-  | 'rejected'
+  | 'no_response'
   | 'cancelled';
 
-export const OPEN_TASK_STATUSES: readonly TaskStatus[] = [
-  'proposed',
-  'approved',
-  'dispatching',
-  'awaiting_response',
-  'evaluating',
-];
+export const OPEN_TASK_STATUSES: readonly TaskStatus[] = ['queued', 'dispatching', 'awaiting_response', 'evaluating'];
 
 export type EvaluationVerdict = 'complete' | 'partial' | 'failed' | 'unclear';
 
@@ -68,15 +93,55 @@ export interface DispatchRecord {
   /** The exact text handed to Arena. */
   prompt: string;
   /**
+   * Reference code unique to this delivery attempt. It is part of the prompt,
+   * so the message can be found again in the Arena page, and Arena is asked to
+   * close its report with it. Empty for deliveries made before references existed.
+   */
+  ref: string;
+  /**
    * True when AgentLink could not confirm whether Arena accepted the prompt
-   * (for example after a restart mid-dispatch). Such a task is never re-sent
-   * automatically.
+   * (for example after a restart mid-dispatch). Such a task is re-sent only
+   * after the Arena page has been checked and does not contain it.
    */
   unconfirmed: boolean;
   error: string | null;
 }
 
 export type ArenaResponseSource = 'auto' | 'manual_capture' | 'pasted';
+
+/**
+ * How AgentLink concluded that a reply was finished:
+ *  - `marker`:  Arena closed its report with the completion line it was asked for.
+ *  - `quiet`:   Arena stopped working and the reply stopped changing, without the completion line.
+ *  - `stalled`: the page still looked busy, but nothing had changed for a long time.
+ *  - `manual`:  a person captured or pasted the reply.
+ */
+export type ArenaCompletion = 'marker' | 'quiet' | 'stalled' | 'manual';
+
+/** Where the open task is on its way to Arena and back, as last reported by the browser extension. */
+export type RelayPhase =
+  | 'waiting_for_arena'
+  | 'sending'
+  | 'verifying'
+  | 'submitted'
+  | 'generating'
+  | 'settling'
+  | 'delivering'
+  | 'delivered'
+  | 'searching'
+  | 'stalled';
+
+export interface RelayStatus {
+  phase: RelayPhase;
+  /** One sentence saying what is happening, or what is in the way. */
+  message: string;
+  /** True when progress depends on something only the user can fix (for example, no Arena tab is open). */
+  attention: boolean;
+  /** Characters of Arena's reply seen so far. */
+  chars: number;
+  dispatchId: string | null;
+  updatedAt: IsoTime;
+}
 
 export interface ArenaResponseRecord {
   id: string;
@@ -86,6 +151,7 @@ export interface ArenaResponseRecord {
   text: string;
   chars: number;
   truncated: boolean;
+  completion: ArenaCompletion;
   /** Set only in views sent to the UI: `text` holds just the beginning; fetch the task for the rest. */
   excerptOnly?: boolean;
 }
@@ -116,13 +182,16 @@ export interface ArenaTask {
   status: TaskStatus;
   createdAt: IsoTime;
   updatedAt: IsoTime;
-  editedByUser: boolean;
-  approvedAt: IsoTime | null;
-  rejection: { reason: string; at: IsoTime } | null;
   dispatch: DispatchRecord | null;
+  /** Live position of the task between AgentLink and Arena. */
+  relay: RelayStatus | null;
   arenaResponse: ArenaResponseRecord | null;
   evaluation: TaskEvaluation | null;
+  /** Why the last evaluation attempt did not produce a verdict. It is retried automatically. */
   evaluationError: string | null;
+  evaluationAttempts: number;
+  /** Why the task was closed without a verdict (`no_response`, `cancelled`). */
+  closedReason: string | null;
   /** Fingerprint of the normalised prompt; used to block duplicate submissions. */
   fingerprint: string;
 }
@@ -288,7 +357,7 @@ export interface Project {
   contextSummary: string;
   /** Set while a coordinator turn runs so an interrupted turn can be repaired after a crash. */
   activeTurn: ActiveTurnMarker | null;
-  /** Things the user changed outside the conversation; passed to the coordinator with its next turn. */
+  /** Things that happened outside the conversation; passed to the coordinator with its next turn. */
   pendingNotices: string[];
 
   counters: ProjectCounters;
@@ -379,7 +448,10 @@ export interface CompanionSettings {
   totalTimeoutMs: number;
   /** Tool-calling rounds Gemini may take within one coordinator turn. */
   maxToolRounds: number;
-  /** Tasks that may be sent to Arena before the session pauses for a check-in. */
+  /**
+   * Safety limit on tasks sent to Arena in one session. It exists to stop a
+   * runaway loop, not to ask for approval; reaching it blocks the session.
+   */
   maxTasksPerSession: number;
   /** Approximate size of the model-facing transcript before older turns are summarised. */
   contextBudgetChars: number;
@@ -391,8 +463,14 @@ export interface TurnState {
   projectId: string;
   active: boolean;
   entryId: string | null;
-  kind: 'user' | 'evaluation' | 'feedback' | null;
+  kind: 'user' | 'evaluation' | 'continue' | null;
   phase: 'idle' | 'waiting' | 'streaming' | 'tools' | 'retrying' | 'compacting';
   startedAt: IsoTime | null;
   retry: { attempt: number; maxAttempts: number; delayMs: number; reason: string } | null;
+}
+
+/** Whether the browser extension that carries tasks to Arena is in contact with the companion. */
+export interface RelayLink {
+  online: boolean;
+  seenAt: IsoTime | null;
 }

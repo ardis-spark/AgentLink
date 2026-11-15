@@ -9,11 +9,14 @@ import {
   type CreateProjectRequest,
   type CredentialStatusResponse,
   type DispatchFailureRequest,
-  type EditTaskRequest,
   type HealthResponse,
   type ModelsResponse,
+  type NoResponseRequest,
   type ProjectListResponse,
   type ProjectResponse,
+  type RelayReportRequest,
+  type RelayWorkResponse,
+  type ResetDispatchRequest,
   type SessionAction,
   type StatusResponse,
   type TaskResponse,
@@ -159,20 +162,8 @@ export class CompanionClient {
   getTask(projectId: string, taskId: string): Promise<TaskResponse> {
     return this.request('GET', this.taskPath(projectId, taskId));
   }
-  editTask(projectId: string, taskId: string, body: EditTaskRequest): Promise<TaskResponse> {
-    return this.request('PATCH', this.taskPath(projectId, taskId), body);
-  }
-  approveTask(projectId: string, taskId: string): Promise<TaskResponse> {
-    return this.request('POST', this.taskPath(projectId, taskId, '/approve'), {});
-  }
-  rejectTask(projectId: string, taskId: string, reason: string): Promise<TaskResponse> {
-    return this.request('POST', this.taskPath(projectId, taskId, '/reject'), { reason });
-  }
   cancelTask(projectId: string, taskId: string): Promise<TaskResponse> {
     return this.request('POST', this.taskPath(projectId, taskId, '/cancel'), {});
-  }
-  retryEvaluation(projectId: string, taskId: string): Promise<TaskResponse> {
-    return this.request('POST', this.taskPath(projectId, taskId, '/evaluate'), {});
   }
   claimDispatch(projectId: string, taskId: string, body: ClaimDispatchRequest): Promise<ClaimDispatchResponse> {
     return this.request('POST', this.taskPath(projectId, taskId, '/dispatch/claim'), body);
@@ -183,8 +174,18 @@ export class CompanionClient {
   failDispatch(projectId: string, taskId: string, body: DispatchFailureRequest): Promise<TaskResponse> {
     return this.request('POST', this.taskPath(projectId, taskId, '/dispatch/fail'), body);
   }
-  resetDispatch(projectId: string, taskId: string): Promise<TaskResponse> {
-    return this.request('POST', this.taskPath(projectId, taskId, '/dispatch/reset'), {});
+  resetDispatch(projectId: string, taskId: string, body: ResetDispatchRequest): Promise<TaskResponse> {
+    return this.request('POST', this.taskPath(projectId, taskId, '/dispatch/reset'), body);
+  }
+  recordNoResponse(projectId: string, taskId: string, body: NoResponseRequest): Promise<TaskResponse> {
+    return this.request('POST', this.taskPath(projectId, taskId, '/no-response'), body);
+  }
+  /** What has to be carried to Arena or fetched from it right now. Asking is also the extension's heartbeat. */
+  relayWork(): Promise<RelayWorkResponse> {
+    return this.request('GET', '/relay/work', undefined, true, 10_000);
+  }
+  reportRelay(projectId: string, taskId: string, body: RelayReportRequest): Promise<void> {
+    return this.request('POST', this.taskPath(projectId, taskId, '/relay'), body, true, 10_000);
   }
   recordArenaResponse(projectId: string, taskId: string, body: ArenaResponseRequest): Promise<TaskResponse> {
     return this.request('POST', this.taskPath(projectId, taskId, '/arena-response'), body);

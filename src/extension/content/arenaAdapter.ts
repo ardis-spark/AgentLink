@@ -1,25 +1,25 @@
 /**
  * The Arena adapter: everything AgentLink does inside an Arena tab.
  *
- * It types an approved task into Arena's composer, confirms that Arena
- * accepted it, and reads Arena's visible reply. It never invents a result:
- * a reply is only reported when it can be tied to the task that was sent
- * (the task's own heading is located in the page and only what follows it is
- * read), and uncertainty is reported as uncertainty.
+ * It types a task into Arena's composer, confirms that Arena accepted it, and
+ * reads Arena's visible reply. It never invents a result: a reply is only
+ * reported when it can be tied to the task that was sent (the task's own
+ * message is located in the page and only what follows it is read), and
+ * uncertainty is reported as uncertainty.
+ *
+ * The adapter keeps no state. Every request is answered from what the page
+ * shows at that moment, so reloading the page, navigating inside Arena or
+ * restarting the extension never loses track of a task: the background script
+ * simply asks again.
  *
  * Arena's markup is not a public contract, so elements are found by role and
  * behaviour rather than by class names, and every selector can be overridden
  * in AgentLink's settings.
  */
-import type {
-  ArenaAdapterConfig,
-  ArenaPageStatus,
-  CaptureResult,
-  ContentEvent,
-  ContentRequest,
-  SubmitPromptResult,
-} from '../../shared/messages.js';
-import { collapse, extractText, isVisible } from './domText.js';
+import { hasCompletionMarker } from '../../shared/arenaPrompt.js';
+import { digestOf } from '../../shared/text.js';
+import type { ArenaAdapterConfig, ArenaPageStatus, CaptureResult, ContentRequest, ProbeResult, SubmitPromptResult } from '../../shared/messages.js';
+import { CHROME_SELECTOR, collapse, extractText, isVisible } from './domText.js';
 
 export interface AdapterTiming {
   /** Pause after typing so the page's framework can enable its send control. */
@@ -27,18 +27,12 @@ export interface AdapterTiming {
   /** How long to wait for evidence that Arena accepted the message. */
   submitConfirmMs: number;
   pollMs: number;
-  /** Minimum gap between progress notifications. */
-  progressMs: number;
-  /** How long to look for the task in the page before giving up watching. */
-  anchorWaitMs: number;
 }
 
 export const DEFAULT_TIMING: AdapterTiming = {
   afterFillMs: 250,
   submitConfirmMs: 12_000,
   pollMs: 1_000,
-  progressMs: 2_000,
-  anchorWaitMs: 90_000,
 };
 
 /** The page's window, including its constructors (events and DOM classes must come from the page's own realm). */
@@ -47,35 +41,27 @@ export type PageWindow = Window & typeof globalThis;
 export interface AdapterEnv {
   doc: Document;
   win: PageWindow;
-  emit: (event: ContentEvent) => void;
   timing?: Partial<AdapterTiming>;
 }
 
 export interface ArenaAdapter {
   handle(request: ContentRequest): Promise<unknown>;
-  dispose(): void;
 }
 
-const MAX_RESPONSE_CHARS = 400_000;
+export const MAX_RESPONSE_CHARS = 1_000_000;
 const SEND_LABEL = /\b(send|submit|run|start|ask|go)\b/i;
 const NOT_SEND_LABEL = /\b(stop|cancel|attach|upload|file|image|voice|mic|record|new chat|settings|menu|model|share|copy|retry|regenerate)\b/i;
 const BUSY_LABEL = /^(stop|interrupt|abort|cancel)\b|\bstop (generating|response|streaming|agent|task|run)/i;
 const COMPOSER_HINT = /\b(ask|message|prompt|task|describe|build|type|tell|what|chat|reply|instruct)/i;
 
-interface Watch {
-  projectId: string;
-  taskId: string;
-  dispatchId: string;
-  prompt: string;
-  config: ArenaAdapterConfig;
-  startedAt: number;
-  lastText: string;
-  lastActivityAt: number;
-  lastProgressAt: number;
-  lastReportedChars: number;
-  lastReportedBusy: boolean;
-  sawBusy: boolean;
-  timer: number;
+export interface TaskAnchor {
+  el: Element;
+  match: NonNullable<ProbeResult['match']>;
+}
+
+/** Letters only, lower case: the same for a prompt as typed and as a page renders it (headings, lists, emphasis). */
+function lettersOnly(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}]+/gu, '');
 }
 
 function safeQuery(root: ParentNode, selector: string): Element[] {
@@ -115,9 +101,6 @@ export function promptProbes(prompt: string): string[] {
 export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
   const { doc, win } = env;
   const timing: AdapterTiming = { ...DEFAULT_TIMING, ...env.timing };
-  let watch: Watch | null = null;
-  let lastMutationAt = 0;
-  let observer: MutationObserver | null = null;
 
   const sleep = (ms: number): Promise<void> => new Promise((resolve) => win.setTimeout(resolve, ms));
   const now = (): number => Date.now();
@@ -316,6 +299,53 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
   }
 
   /**
+   * Climbs from an element inside the sent message to the smallest element that holds the whole message,
+   * without swallowing what comes after it. Going one level up is accepted while the text that it adds is
+   * either trivial (a name, a time, "Show more") or recognisably part of the prompt.
+   */
+  function messageOf(start: Element, prompt: string, stop: (up: Element) => boolean = () => false): Element {
+    const promptLength = collapse(prompt).length;
+    const promptLetters = lettersOnly(prompt);
+    const probes = promptProbes(prompt);
+    let message = start;
+    for (;;) {
+      const content = collapse(message.textContent ?? '');
+      const whole = content.length >= promptLength * 0.8 || (probes.length > 0 && probes.every((probe) => content.includes(probe)));
+      if (whole) break;
+      const up = message.parentElement;
+      if (!up || up === doc.body || up === doc.documentElement) break;
+      const upText = collapse(up.textContent ?? '');
+      if (upText.length > promptLength * 1.25 + 160) break;
+      if (stop(up)) break;
+      const at = upText.indexOf(content);
+      const added = lettersOnly(at >= 0 ? `${upText.slice(0, at)} ${upText.slice(at + content.length)}` : upText);
+      if (added.length > 24) {
+        const middle = Math.floor(added.length / 2);
+        const samples = [added.slice(0, 24), added.slice(middle - 12, middle + 12), added.slice(-24)];
+        // Text that is nowhere in the prompt belongs to another message (usually Arena's reply).
+        if (samples.every((sample) => !promptLetters.includes(sample))) break;
+      }
+      message = up;
+    }
+    return message;
+  }
+
+  /** Visible text nodes of the conversation: not the composer, not page furniture such as a sidebar. */
+  function conversationTextNodes(composer: HTMLElement | null, accept: (text: string) => boolean): { parent: Element; text: string }[] {
+    const root = composer ? composerRoot(composer) : null;
+    const found: { parent: Element; text: string }[] = [];
+    const walker = doc.createTreeWalker(doc.body, 4 /* SHOW_TEXT */);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const text = collapse(node.nodeValue ?? '');
+      if (!text || !accept(text)) continue;
+      const parent = node.parentElement;
+      if (!parent || (root && root.contains(parent)) || parent.closest(CHROME_SELECTOR) || !isVisible(parent, win)) continue;
+      found.push({ parent, text });
+    }
+    return found;
+  }
+
+  /**
    * Finds the user messages in the conversation that carry this task. A match needs the task heading and, where
    * the prompt allows it, another passage of the prompt — so a reply from Arena that merely mentions the task
    * by name is not mistaken for the message that was sent.
@@ -324,36 +354,60 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
     const { full, short } = taskNeedles(prompt);
     if (!short) return [];
     const probes = promptProbes(prompt);
-    const root = composer ? composerRoot(composer) : null;
     const promptLength = collapse(prompt).length;
     const anchors: Element[] = [];
-    const walker = doc.createTreeWalker(doc.body, 4 /* SHOW_TEXT */);
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      const text = collapse(node.nodeValue ?? '');
-      if (!text.includes(short)) continue;
-      const parent = node.parentElement;
-      if (!parent || (root && root.contains(parent)) || !isVisible(parent, win)) continue;
+    for (const { parent, text } of conversationTextNodes(composer, (value) => value.includes(short))) {
       // The heading opens the message, either as raw text ("# Task T-1: …") or rendered as a heading.
       const lead = text.replace(/^#+\s*/, '');
       if (!lead.startsWith(short) && !collapse(parent.textContent ?? '').includes(full.slice(0, 40))) continue;
-
-      // Climb to the smallest element that holds the whole message, without swallowing neighbouring messages.
-      let message: Element = parent;
-      for (;;) {
-        const content = collapse(message.textContent ?? '');
-        const whole = content.length >= promptLength * 0.8 || (probes.length > 0 && probes.every((probe) => content.includes(probe)));
-        if (whole) break;
-        const up = message.parentElement;
-        if (!up || up === doc.body || collapse(up.textContent ?? '').length > promptLength * 1.25 + 160) break;
-        // A message never contains another message: stop below anything that already holds a known one.
-        if (anchors.some((known) => up.contains(known))) break;
-        message = up;
-      }
+      // A message never contains another message: stop below anything that already holds a known one.
+      const message = messageOf(parent, prompt, (up) => anchors.some((known) => up.contains(known)));
       const content = collapse(message.textContent ?? '');
       const isSentMessage = probes.length > 0 ? probes.some((probe) => content.includes(probe)) : content.length >= promptLength * 0.5;
       if (isSentMessage && !anchors.some((known) => known === message || known.contains(message))) anchors.push(message);
     }
     return anchors;
+  }
+
+  /**
+   * Locates the message that carries this task, trying the strongest evidence first:
+   *
+   *  1. the reference code of the delivery attempt. It is unique, so it survives a page that shortens long
+   *     messages. Arena repeats the code in the closing line of its report; that line is left out, and of
+   *     the remaining places the one holding the most text of the task is the sent message;
+   *  2. the task heading together with further passages of the prompt (also finds an earlier delivery
+   *     attempt of the same task);
+   *  3. the task heading alone, taking the first place it appears: a message always precedes its reply.
+   */
+  function findAnchor(prompt: string, ref: string, composer: HTMLElement | null): TaskAnchor | null {
+    if (ref) {
+      const places = conversationTextNodes(composer, (value) => value.includes(ref));
+      // Arena repeats the code in its closing line. Those places are part of the reply, never of the message,
+      // and the message must not be widened until it swallows them.
+      const closing = places.filter((place) => hasCompletionMarker(place.text, ref)).map((place) => place.parent);
+      const holdsReply = (up: Element): boolean => closing.some((line) => up.contains(line));
+      let best: Element | null = null;
+      let bestLength = 0;
+      for (const { parent } of places) {
+        if (closing.includes(parent)) continue;
+        const message = messageOf(parent, prompt, holdsReply);
+        const length = collapse(message.textContent ?? '').length;
+        // A message precedes its reply, so of equally good places the first one wins.
+        if (length > bestLength) {
+          best = message;
+          bestLength = length;
+        }
+      }
+      // Anything as short as the code itself is a mention of it, not the message.
+      if (best && bestLength > ref.length + 40) return { el: best, match: 'ref' };
+    }
+    const strong = findAnchors(prompt, composer).pop();
+    if (strong) return { el: strong, match: 'prompt' };
+
+    const { full, short } = taskNeedles(prompt);
+    if (!short) return null;
+    const heading = conversationTextNodes(composer, (value) => value.replace(/^#+\s*/, '').startsWith(short) && value.includes(full.slice(0, 40)))[0];
+    return heading ? { el: messageOf(heading.parent, prompt), match: 'heading' } : null;
   }
 
   function responseAfter(anchor: Element, composer: HTMLElement | null, config: ArenaAdapterConfig): string {
@@ -383,22 +437,27 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
       composerFound: composer !== null,
       sendButtonFound: composer !== null && findSendButton(composer, config) !== null,
       busy: isBusy(config),
-      watchingDispatchId: watch?.dispatchId ?? null,
+      composerDraft: composer ? collapse(composerText(composer)).slice(0, 160) : '',
     };
   }
 
   // ----------------------------------------------------------------- submit ---
 
-  async function submit(prompt: string, config: ArenaAdapterConfig): Promise<SubmitPromptResult> {
+  async function submit(prompt: string, ref: string, config: ArenaAdapterConfig): Promise<SubmitPromptResult> {
     const composer = findComposer(config);
+    // Sending is idempotent: a task that is already in the conversation is never typed a second time.
+    if (findAnchor(prompt, ref, composer)) return { ok: true, confirmed: true };
     if (!composer) {
       return { ok: false, submitted: false, error: "Arena's message box was not found in this tab. Open an Arena Agent Mode conversation, or set the composer selector in AgentLink settings." };
     }
     if (isBusy(config)) {
-      return { ok: false, submitted: false, error: 'Arena is still working on a previous request in this tab. Wait for it to finish, then send again.' };
+      return { ok: false, submitted: false, error: 'Arena is still working on a previous request in this tab. AgentLink sends the task when Arena is free.' };
     }
-    if (collapse(composerText(composer))) {
-      return { ok: false, submitted: false, error: "Arena's message box already contains text. Clear or send it first so AgentLink does not overwrite your draft." };
+    const draft = collapse(composerText(composer));
+    // Text left behind by an earlier attempt of this same task is simply replaced; anything else is a person's draft.
+    const ownLeftover = draft.length > 0 && draft.includes(taskNeedles(prompt).full.slice(0, 40));
+    if (draft && !ownLeftover) {
+      return { ok: false, submitted: false, error: "Arena's message box already contains text. Clear or send it; AgentLink does not overwrite a draft and sends the task as soon as the box is empty." };
     }
 
     const anchorsBefore = findAnchors(prompt, composer).length;
@@ -415,7 +474,7 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
         error:
           got > 0
             ? `Arena's message box kept only ${got} of ${collapse(prompt).length} characters, so the task was not sent. It may be too long for Arena.`
-            : "AgentLink could not type into Arena's message box. Use \"Send manually\" instead.",
+            : "AgentLink could not type into Arena's message box. Set the composer selector in AgentLink settings if the box was not recognised.",
       };
     }
 
@@ -430,7 +489,7 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
     while (now() < deadline) {
       await sleep(Math.min(200, timing.pollMs));
       const current = findComposer(config) ?? composer;
-      if (findAnchors(prompt, current).length > anchorsBefore) return { ok: true, confirmed: true };
+      if (findAnchors(prompt, current).length > anchorsBefore || findAnchor(prompt, ref, current)?.match === 'ref') return { ok: true, confirmed: true };
       const cleared = !current.isConnected || !holdsPrompt(current, prompt);
       if (cleared) {
         clearedAt ??= now();
@@ -442,7 +501,7 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
       return {
         ok: false,
         submitted: 'unknown',
-        error: "Arena's message box was emptied, but the task did not appear in the conversation. Check the Arena tab before sending anything again.",
+        error: "Arena's message box was emptied, but the task did not appear in the conversation yet.",
       };
     }
     // Nothing happened: take the text back out so the task can be retried without leaving a stray draft.
@@ -452,141 +511,57 @@ export function createArenaAdapter(env: AdapterEnv): ArenaAdapter {
       ok: false,
       submitted: removed ? false : 'unknown',
       error: removed
-        ? 'Arena did not accept the message (its send control did not respond). Nothing was sent. Try again, set the send-button selector in settings, or use "Send manually".'
-        : 'Arena did not confirm the message and the text is still in its message box. Check the Arena tab before sending anything again.',
+        ? 'Arena did not accept the message (its send control did not respond). Nothing was sent. If this keeps happening, set the send-button selector in AgentLink settings.'
+        : 'Arena did not confirm the message and the text is still in its message box.',
     };
   }
 
-  // ------------------------------------------------------------------ watch ---
+  // ---------------------------------------------------------------- reading ---
 
-  function stopWatch(): void {
-    if (watch) win.clearTimeout(watch.timer);
-    watch = null;
-    observer?.disconnect();
-    observer = null;
-  }
-
-  function tick(): void {
-    const current = watch;
-    if (!current) return;
-    const { config } = current;
-    const base = { projectId: current.projectId, taskId: current.taskId, dispatchId: current.dispatchId };
-    const elapsed = now() - current.startedAt;
+  /** What the page shows for this task right now. Called every few seconds by the background script. */
+  function probe(prompt: string, ref: string, config: ArenaAdapterConfig): ProbeResult {
     const composer = findComposer(config);
-    const anchor = findAnchors(current.prompt, composer).pop() ?? null;
-
-    if (!anchor) {
-      if (elapsed > timing.anchorWaitMs) {
-        stopWatch();
-        env.emit({ type: 'agentlink:arena:timeout', ...base, chars: 0 });
-        return;
-      }
-      current.timer = win.setTimeout(tick, timing.pollMs);
-      return;
-    }
-
-    const text = responseAfter(anchor, composer, config);
-    const busy = isBusy(config);
-    const time = now();
-    if (text !== current.lastText) {
-      current.lastText = text;
-      current.lastActivityAt = time;
-    }
-    if (busy) {
-      current.sawBusy = true;
-      current.lastActivityAt = time;
-    }
-    const quietFor = time - Math.max(current.lastActivityAt, lastMutationAt);
-    // If this page never showed a recognisable "working" signal, silence is weaker evidence that Arena has
-    // finished, so a longer quiet period is required before the reply is treated as final.
-    const required = current.sawBusy ? config.settleMs : config.settleMs * 3;
-
-    if (text.length > 0 && !busy && quietFor >= required) {
-      stopWatch();
-      env.emit({ type: 'agentlink:arena:response', ...base, text });
-      return;
-    }
-    if (elapsed > config.maxWaitMs) {
-      stopWatch();
-      env.emit({ type: 'agentlink:arena:timeout', ...base, chars: text.length });
-      return;
-    }
-    const changed = text.length !== current.lastReportedChars || busy !== current.lastReportedBusy;
-    if (changed && time - current.lastProgressAt >= timing.progressMs) {
-      current.lastProgressAt = time;
-      current.lastReportedChars = text.length;
-      current.lastReportedBusy = busy;
-      env.emit({ type: 'agentlink:arena:progress', ...base, generating: busy || quietFor < required, chars: text.length });
-    }
-    current.timer = win.setTimeout(tick, timing.pollMs);
-  }
-
-  function startWatch(request: Extract<ContentRequest, { type: 'agentlink:arena:watch' }>): { ok: true } {
-    stopWatch();
-    const time = now();
-    lastMutationAt = time;
-    watch = {
-      projectId: request.projectId,
-      taskId: request.taskId,
-      dispatchId: request.dispatchId,
-      prompt: request.prompt,
-      config: request.config,
-      startedAt: time,
-      lastText: '',
-      lastActivityAt: time,
-      lastProgressAt: 0,
-      lastReportedChars: -1,
-      lastReportedBusy: false,
-      sawBusy: false,
-      timer: win.setTimeout(tick, timing.pollMs),
+    const anchor = findAnchor(prompt, ref, composer);
+    const text = anchor ? responseAfter(anchor.el, composer, config) : '';
+    return {
+      ok: true,
+      url: win.location.href,
+      found: anchor !== null,
+      match: anchor?.match ?? null,
+      busy: isBusy(config),
+      chars: text.length,
+      digest: digestOf(text),
+      marker: text.length > 0 && hasCompletionMarker(text, ref),
+      composerHoldsPrompt: composer !== null && holdsPrompt(composer, prompt),
     };
-    if (typeof win.MutationObserver === 'function') {
-      let root: HTMLElement | null = null;
-      let rootCheckedAt = 0;
-      observer = new win.MutationObserver((records) => {
-        const at = now();
-        if (at - rootCheckedAt > 2_000 || (root && !root.isConnected)) {
-          const composer = findComposer(request.config);
-          root = composer ? composerRoot(composer) : null;
-          rootCheckedAt = at;
-        }
-        // Typing in the composer is not Arena working.
-        if (records.some((record) => !(root && root.contains(record.target)))) lastMutationAt = at;
-      });
-      observer.observe(doc.body, { childList: true, subtree: true, characterData: true });
-    }
-    return { ok: true };
   }
 
-  function capture(prompt: string, config: ArenaAdapterConfig): CaptureResult {
+  function capture(prompt: string, ref: string, config: ArenaAdapterConfig): CaptureResult {
     const composer = findComposer(config);
-    const anchor = findAnchors(prompt, composer).pop() ?? null;
+    const anchor = findAnchor(prompt, ref, composer);
     if (!anchor) {
-      return { ok: false, error: 'This task was not found in the Arena tab, so its reply cannot be identified. Open the conversation it was sent in, or paste the reply instead.' };
+      return { ok: false, error: 'This task was not found in the Arena tab, so its reply cannot be identified. Open the conversation it was sent in.' };
     }
-    const text = responseAfter(anchor, composer, config);
+    const text = responseAfter(anchor.el, composer, config);
     if (!text) return { ok: false, error: 'Arena has not replied to this task yet.' };
-    return { ok: true, text };
+    return { ok: true, text, marker: hasCompletionMarker(text, ref), busy: isBusy(config) };
   }
 
   return {
     async handle(request: ContentRequest): Promise<unknown> {
+      const ref = 'ref' in request && typeof request.ref === 'string' ? request.ref : '';
       switch (request.type) {
         case 'agentlink:arena:ping':
           return status(request.config);
         case 'agentlink:arena:submit':
-          return submit(request.prompt, request.config);
-        case 'agentlink:arena:watch':
-          return startWatch(request);
+          return submit(request.prompt, ref, request.config);
+        case 'agentlink:arena:probe':
+          return probe(request.prompt, ref, request.config);
         case 'agentlink:arena:capture':
-          return capture(request.prompt, request.config);
-        case 'agentlink:arena:cancel':
-          if (!request.dispatchId || watch?.dispatchId === request.dispatchId) stopWatch();
-          return { ok: true };
+          return capture(request.prompt, ref, request.config);
         default:
           return undefined;
       }
     },
-    dispose: stopWatch,
   };
 }

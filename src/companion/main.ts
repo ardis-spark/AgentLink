@@ -34,6 +34,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  companion.orchestrator.startWatchdog();
   const address = companion.server.address;
   const status = companion.gemini.status();
   // The pairing token is printed on purpose: it is how the user pairs the extension. It is not the Gemini key.
@@ -67,6 +68,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     if (closing) return;
     closing = true;
+    companion.orchestrator.dispose();
     void companion.server.close().then(() => process.exit(0));
     setTimeout(() => process.exit(0), 2_000).unref();
   };

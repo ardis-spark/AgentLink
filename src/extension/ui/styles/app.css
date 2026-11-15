@@ -162,6 +162,38 @@ body {
   font-size: var(--fs-small);
 }
 
+/* Shown only when the loop cannot move by itself: what it needs, and the way to give it. */
+.attention {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--rule);
+  border-left: 2px solid var(--warn);
+  background: var(--ink-1);
+}
+.attention--bad {
+  border-left-color: var(--red);
+  background: var(--red-wash);
+}
+.attention__text {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.attention__title {
+  font-weight: 600;
+}
+.attention__detail {
+  margin-top: 2px;
+  font-size: var(--fs-small);
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ================================================================== setup === */
 
 .setup {
@@ -317,7 +349,7 @@ body {
 }
 .relay__stages {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 .stage {
   position: relative;
@@ -787,9 +819,6 @@ body {
   padding-bottom: var(--s-3);
   border-bottom: 1px solid var(--rule);
 }
-.task--proposed .task__head {
-  border-bottom-color: var(--red);
-}
 .task__ids {
   display: flex;
   flex-wrap: wrap;
@@ -982,8 +1011,6 @@ body {
   font-size: var(--fs-small);
   color: var(--text-2);
 }
-.task-editor,
-.reject,
 .paste {
   display: grid;
   gap: var(--s-3);

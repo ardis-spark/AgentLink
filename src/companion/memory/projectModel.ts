@@ -4,6 +4,7 @@ import { fingerprint } from '../../shared/text.js';
 import {
   OPEN_TASK_STATUSES,
   type ArenaTask,
+  type Blocker,
   type ConversationEntry,
   type ConversationKind,
   type ConversationRole,
@@ -42,7 +43,7 @@ export function createProject(input: { name: string; objective: string; instruct
     decisions: [],
     issues: [],
     timeline: [],
-    session: { status: 'idle', startedAt: null, updatedAt: at, pauseReason: null, tasksDispatched: 0, note: null },
+    session: { status: 'idle', startedAt: null, updatedAt: at, blocker: null, tasksDispatched: 0, idleTurns: 0, note: null },
     conversation: [],
     transcript: [],
     contextSummary: '',
@@ -105,6 +106,19 @@ export function addEntry(
   return entry;
 }
 
+/**
+ * Stops the session because it cannot continue without the user. This is the
+ * only way AgentLink hands control back; it always says why.
+ */
+export function blockSession(project: Project, blocker: Omit<Blocker, 'at'>): void {
+  const at = nowIso();
+  project.session.status = 'blocked';
+  project.session.blocker = { ...blocker, at };
+  project.session.updatedAt = at;
+  project.session.note = null;
+  addEvent(project, 'session', 'warning', `Waiting for you: ${blocker.title}`, blocker.detail, blocker.taskId);
+}
+
 export function isOpenTask(task: ArenaTask): boolean {
   return OPEN_TASK_STATUSES.includes(task.status);
 }
@@ -122,8 +136,80 @@ export function syncCurrentTask(project: Project): void {
   project.currentTaskId = openTask(project)?.id ?? null;
 }
 
-export function taskPrompt(project: Project, task: ArenaTask): string {
-  return renderArenaPrompt({ task, projectName: project.name, constraints: project.constraints });
+export function taskPrompt(project: Project, task: ArenaTask, ref = ''): string {
+  return renderArenaPrompt({ task, projectName: project.name, constraints: project.constraints, ...(ref ? { ref } : {}) });
+}
+
+/**
+ * Brings a project written by an earlier version up to the current model.
+ * Earlier versions waited for the user to approve each task; those tasks are
+ * simply queued now. Returns true when anything was changed.
+ */
+export function upgradeProject(project: Project): boolean {
+  let changed = false;
+  const legacySession = project.session as Project['session'] & { pauseReason?: string | null };
+  if (legacySession.blocker === undefined) {
+    legacySession.blocker = null;
+    changed = true;
+  }
+  if (typeof legacySession.idleTurns !== 'number') {
+    legacySession.idleTurns = 0;
+    changed = true;
+  }
+  if ('pauseReason' in legacySession) {
+    // A session that an earlier version paused by itself (restart, task limit) simply carries on.
+    if (legacySession.status === 'paused' && legacySession.pauseReason && legacySession.pauseReason !== 'user') {
+      legacySession.status = 'running';
+      legacySession.tasksDispatched = 0;
+      legacySession.note = null;
+    }
+    delete legacySession.pauseReason;
+    changed = true;
+  }
+  if (!Array.isArray(project.pendingNotices)) {
+    project.pendingNotices = [];
+    changed = true;
+  }
+  for (const task of project.tasks) {
+    const legacy = task as ArenaTask & { editedByUser?: unknown; approvedAt?: unknown; rejection?: { reason?: string } | null };
+    const status: string = task.status;
+    if (status === 'proposed' || status === 'approved') {
+      task.status = 'queued';
+      changed = true;
+    } else if (status === 'rejected') {
+      task.status = 'cancelled';
+      task.closedReason = legacy.rejection?.reason ? `Rejected: ${legacy.rejection.reason}` : 'Rejected.';
+      changed = true;
+    }
+    if (task.relay === undefined) {
+      task.relay = null;
+      changed = true;
+    }
+    if (typeof task.evaluationAttempts !== 'number') {
+      task.evaluationAttempts = 0;
+      changed = true;
+    }
+    if (task.closedReason === undefined) {
+      task.closedReason = null;
+      changed = true;
+    }
+    if (task.dispatch && typeof task.dispatch.ref !== 'string') {
+      task.dispatch.ref = '';
+      changed = true;
+    }
+    if (task.arenaResponse && !task.arenaResponse.completion) {
+      task.arenaResponse.completion = task.arenaResponse.source === 'auto' ? 'quiet' : 'manual';
+      changed = true;
+    }
+    for (const key of ['editedByUser', 'approvedAt', 'rejection'] as const) {
+      if (key in legacy) {
+        delete legacy[key];
+        changed = true;
+      }
+    }
+  }
+  if (changed) syncCurrentTask(project);
+  return changed;
 }
 
 /**

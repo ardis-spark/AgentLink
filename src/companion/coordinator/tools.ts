@@ -11,7 +11,7 @@ import type {
   TaskStatus,
   ToolAction,
 } from '../../shared/types.js';
-import { addEvent, findTask, isOpenTask, nowIso, openTask, syncCurrentTask, taskFingerprint, touch } from '../memory/projectModel.js';
+import { addEvent, blockSession, findTask, isOpenTask, nowIso, openTask, syncCurrentTask, taskFingerprint, touch } from '../memory/projectModel.js';
 
 /** Tools Gemini uses to act as coordinator. Each one changes project memory under rules enforced in `executeTool`. */
 export const COORDINATOR_TOOLS: FunctionDeclaration[] = [
@@ -56,9 +56,9 @@ export const COORDINATOR_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
-    name: 'propose_arena_task',
+    name: 'dispatch_arena_task',
     description:
-      'Propose the next task for Arena. The task is shown to the user, who must approve, edit or reject it; nothing is sent until they approve. Fails if another task is still open or if the same task was already sent.',
+      'Send the next task to Arena. AgentLink delivers it to Arena immediately and without asking the user, waits for Arena to finish, and returns Arena\'s complete reply to you for evaluation. Fails if another task is still open or if the same task was already sent.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -70,7 +70,7 @@ export const COORDINATOR_TOOLS: FunctionDeclaration[] = [
           items: { type: Type.STRING },
           description: 'Concrete checks that Arena\'s report must demonstrate.',
         },
-        rationale: { type: Type.STRING, description: 'One or two sentences for the user: why this task, and why now.' },
+        rationale: { type: Type.STRING, description: 'One or two sentences for the record: why this task, and why now.' },
         milestone_id: { type: Type.STRING, description: 'Milestone this task serves, e.g. "M-1".' },
       },
       required: ['title', 'instructions', 'acceptance_criteria', 'rationale'],
@@ -148,6 +148,20 @@ export const COORDINATOR_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'request_user_input',
+    description:
+      'Stop and wait for the user. Use ONLY for a genuine blocker: a decision that needs information or authorisation you cannot safely determine yourself (credentials, payments, destructive or irreversible actions outside the stated scope, a choice between materially different products). Never use it to ask for approval of a task, a plan or a milestone, to report progress, or for anything you can decide from the objective. Refused while a task is in progress.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        question: { type: Type.STRING, description: 'The single, specific question the user must answer.' },
+        why: { type: Type.STRING, description: 'Why you cannot decide this yourself, and what is blocked until it is answered.' },
+        options: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Concrete answers to choose from, if there are any.' },
+      },
+      required: ['question', 'why'],
+    },
+  },
+  {
     name: 'mark_objective_complete',
     description:
       'Declare the whole objective complete. Refused while a task is open, while any milestone is unfinished, or when no task has been verified as completed.',
@@ -209,7 +223,8 @@ const VERDICT_STATUS: Record<EvaluationVerdict, TaskStatus> = {
   unclear: 'inconclusive',
 };
 
-const SENT_STATUSES: readonly TaskStatus[] = ['dispatching', 'awaiting_response', 'evaluating', 'completed', 'partial', 'failed', 'inconclusive'];
+/** Tasks whose text Arena has received and answered (or is working on); the same text is not sent twice. */
+const SENT_STATUSES: readonly TaskStatus[] = ['queued', 'dispatching', 'awaiting_response', 'evaluating', 'completed', 'partial', 'failed', 'inconclusive'];
 
 function setPlan(project: Project, args: Record<string, unknown>): ToolOutcome['response'] & { summary: string } {
   const raw = args.milestones;
@@ -281,17 +296,25 @@ function updateMilestone(project: Project, args: Record<string, unknown>): ToolO
   return { summary: `${milestone.id} "${milestone.title}" → ${status.replace('_', ' ')}`, milestone_id: milestone.id, status, current_milestone_id: project.currentMilestoneId };
 }
 
-function proposeTask(project: Project, args: Record<string, unknown>, ctx: ToolContext): ToolOutcome['response'] & { summary: string } {
-  if (project.status === 'complete') refuse('The objective is marked complete. The user must reopen the session before new tasks are proposed.');
+function dispatchTask(project: Project, args: Record<string, unknown>, ctx: ToolContext): ToolOutcome['response'] & { summary: string } {
+  if (project.status === 'complete') refuse('The objective is marked complete. A new session must be started before more tasks are sent.');
+  if (project.session.status === 'blocked') refuse('The session is waiting for the user to answer. Nothing can be sent to Arena until they do. End your turn.');
   const open = openTask(project);
   if (open) {
     refuse(
-      `Task ${open.id} "${open.title}" is still open (status: ${open.status}). Only one task may be open at a time; wait until it is resolved before proposing another.`,
+      `Task ${open.id} "${open.title}" is still open (status: ${open.status}). Only one task may be open at a time; AgentLink will bring you its result. Do not send another task until then.`,
     );
   }
   if (project.session.tasksDispatched >= ctx.settings.maxTasksPerSession) {
+    blockSession(project, {
+      kind: 'task_budget',
+      title: 'Task safety limit reached',
+      detail: `${project.session.tasksDispatched} tasks were sent to Arena in this session, which is the configured safety limit (${ctx.settings.maxTasksPerSession}). Continue the session to carry on, or raise the limit in the companion settings.`,
+      options: [],
+      taskId: null,
+    });
     refuse(
-      `This session has already sent ${project.session.tasksDispatched} tasks to Arena, which is the configured limit. Tell the user; they must pause and resume the session to continue.`,
+      `This session has already sent ${project.session.tasksDispatched} tasks to Arena, which is the configured safety limit. AgentLink has told the user and is waiting for them. Summarise where the work stands and end your turn.`,
     );
   }
   const title = ctx.scrub(str(args, 'title', { required: true, max: 200 }));
@@ -314,13 +337,6 @@ function proposeTask(project: Project, args: Record<string, unknown>, ctx: ToolC
     );
   }
 
-  const rejected = project.tasks.find((t) => t.fingerprint === fp && t.status === 'rejected');
-  if (rejected) {
-    refuse(
-      `The user already rejected this exact task (${rejected.id}${rejected.rejection?.reason ? `, reason: "${excerpt(rejected.rejection.reason, 200)}"` : ''}). Propose something different, or ask the user what they want.`,
-    );
-  }
-
   project.counters.task += 1;
   const at = nowIso();
   const task: ArenaTask = {
@@ -332,26 +348,48 @@ function proposeTask(project: Project, args: Record<string, unknown>, ctx: ToolC
     acceptanceCriteria,
     rationale,
     milestoneId: milestoneId || null,
-    status: 'proposed',
+    status: 'queued',
     createdAt: at,
     updatedAt: at,
-    editedByUser: false,
-    approvedAt: null,
-    rejection: null,
     dispatch: null,
+    relay: null,
     arenaResponse: null,
     evaluation: null,
     evaluationError: null,
+    evaluationAttempts: 0,
+    closedReason: null,
     fingerprint: fp,
   };
   project.tasks.push(task);
   syncCurrentTask(project);
-  addEvent(project, 'task', 'info', `Task ${task.id} proposed: ${task.title}`, rationale, task.id);
+  project.session.idleTurns = 0;
+  addEvent(project, 'task', 'info', `Task ${task.id} queued for Arena: ${task.title}`, rationale, task.id);
   return {
-    summary: `Proposed ${task.id}: ${task.title}`,
+    summary: `Queued ${task.id} for Arena: ${task.title}`,
     task_id: task.id,
-    status: 'proposed',
-    note: 'The task is now shown to the user. Nothing is sent to Arena until they approve it. Do not propose another task until this one is resolved.',
+    status: 'queued',
+    note: 'AgentLink is delivering this task to Arena now and will hand you Arena\'s reply when it is finished. End your turn with one or two sentences; do not wait, do not ask the user anything, and do not send another task.',
+  };
+}
+
+function requestUserInput(project: Project, args: Record<string, unknown>, ctx: ToolContext): ToolOutcome['response'] & { summary: string } {
+  const question = ctx.scrub(str(args, 'question', { required: true, max: 2000 }));
+  const why = ctx.scrub(str(args, 'why', { required: true, max: 2000 }));
+  const options = cleanList(args.options, 6, 300).map(ctx.scrub);
+  const open = openTask(project);
+  if (open) {
+    refuse(
+      `Task ${open.id} is still in progress (status: ${open.status}). The work is not blocked while Arena is working; wait for its result. If you still need the user afterwards, ask then.`,
+    );
+  }
+  if (project.session.status === 'blocked' && project.session.blocker) {
+    refuse(`The session is already waiting for the user (${project.session.blocker.title}). End your turn.`);
+  }
+  blockSession(project, { kind: 'question', title: question, detail: why, options, taskId: null });
+  return {
+    summary: `Waiting for the user: ${excerpt(question, 160)}`,
+    status: 'waiting_for_user',
+    note: 'The session is paused until the user answers. Put the question to the user in your reply, briefly, and end your turn.',
   };
 }
 
@@ -396,8 +434,8 @@ function evaluateResult(project: Project, args: Record<string, unknown>, ctx: To
     task_status: task.status,
     note:
       verdict === 'complete'
-        ? 'Recorded. Update milestones if this finishes one, then decide whether more work is needed.'
-        : 'Recorded. Decide what should happen next; a follow-up task must state what was wrong and what must be different.',
+        ? 'Recorded. Update milestones if this finishes one. Then, in this same turn, send the next task with dispatch_arena_task, or call mark_objective_complete if the whole objective is now demonstrated.'
+        : 'Recorded. In this same turn, send a follow-up task with dispatch_arena_task that states what was wrong or missing and what must be different. Do not ask the user what to do.',
   };
 }
 
@@ -477,7 +515,8 @@ function markComplete(project: Project, args: Record<string, unknown>): ToolOutc
   project.completion = { summary, at: nowIso() };
   project.session.status = 'completed';
   project.session.updatedAt = nowIso();
-  project.session.pauseReason = null;
+  project.session.blocker = null;
+  project.session.idleTurns = 0;
   addEvent(project, 'project', 'success', 'Objective complete', summary);
   return { summary: 'Objective marked complete', status: 'complete', verified_tasks: completed.map((t) => t.id) };
 }
@@ -496,8 +535,11 @@ export function executeTool(project: Project, name: string, args: Record<string,
       case 'update_milestone':
         result = updateMilestone(project, args);
         break;
-      case 'propose_arena_task':
-        result = proposeTask(project, args, ctx);
+      case 'dispatch_arena_task':
+        result = dispatchTask(project, args, ctx);
+        break;
+      case 'request_user_input':
+        result = requestUserInput(project, args, ctx);
         break;
       case 'evaluate_arena_result':
         result = evaluateResult(project, args, ctx);

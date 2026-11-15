@@ -159,7 +159,7 @@ describe('Gemini streaming', () => {
       ['model', 'reply'],
       ['user', 'second'],
     ]);
-    expect(request.body.tools[0].functionDeclarations.map((f: any) => f.name)).toContain('propose_arena_task');
+    expect(request.body.tools[0].functionDeclarations.map((f: any) => f.name)).toContain('dispatch_arena_task');
     expect(request.body.toolConfig.functionCallingConfig).toEqual({ mode: 'ANY', allowedFunctionNames: ['evaluate_arena_result'] });
     // Sampling parameters are deprecated for current Gemini models and must not be sent.
     expect(JSON.stringify(request.body)).not.toMatch(/temperature|topP|topK/);

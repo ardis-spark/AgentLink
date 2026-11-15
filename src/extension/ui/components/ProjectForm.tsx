@@ -23,7 +23,8 @@ export function ProjectForm({ project, onDone, onCancel }: { project: ProjectVie
   const submit = async (): Promise<void> => {
     if (!valid) return;
     const body = { name: name.trim(), objective: objective.trim(), instructions: instructions.trim(), constraints: toLines(constraints) };
-    const ok = project ? await store.updateProject(body) : await store.createProject(body);
+    // A new project starts working at once: giving the objective is the only step.
+    const ok = project ? await store.updateProject(body) : await store.createProject({ ...body, start: true });
     if (ok) onDone();
   };
 
@@ -46,7 +47,7 @@ export function ProjectForm({ project, onDone, onCancel }: { project: ProjectVie
           Objective
         </label>
         <AutoTextarea id="project-objective" class="textarea" maxRows={8} value={objective} placeholder="What should be true when this project is done?" onInput={(e) => setObjective((e.currentTarget as HTMLTextAreaElement).value)} />
-        {project && <p class="field__hint">Changing the objective is passed to Gemini with your next message.</p>}
+        <p class="field__hint">{project ? 'A changed objective is passed to Gemini with its next step.' : 'This is all AgentLink needs. It starts as soon as you press Start and keeps going by itself.'}</p>
       </div>
       <div class="field">
         <label class="label" for="project-instructions">
@@ -64,7 +65,7 @@ export function ProjectForm({ project, onDone, onCancel }: { project: ProjectVie
       <div class="button-row button-row--spread">
         <div class="button-row">
           <Button variant="primary" type="submit" busy={busy} disabled={!valid}>
-            {project ? 'Save project' : 'Create project'}
+            {project ? 'Save project' : 'Start'}
           </Button>
           {onCancel && <Button onClick={onCancel}>Cancel</Button>}
         </div>

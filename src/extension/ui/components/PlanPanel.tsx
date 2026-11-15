@@ -135,7 +135,7 @@ export function TimelinePanel({ project, onShowTask }: { project: ProjectView | 
       <PaneHeader title="Activity" meta={events.length > 0 ? `${events.length} events` : undefined} />
       <div class="pane__scroll">
         {events.length === 0 ? (
-          <Empty title="Nothing has happened yet.">Every approval, dispatch, reply and review is recorded here and kept with the project.</Empty>
+          <Empty title="Nothing has happened yet.">Every task sent, reply received and review made is recorded here and kept with the project.</Empty>
         ) : (
           <ol class="timeline">
             {events.map((event) => (

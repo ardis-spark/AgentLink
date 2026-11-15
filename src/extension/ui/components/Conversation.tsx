@@ -2,7 +2,7 @@ import type { VNode } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ConversationEntry, TurnState } from '../../../shared/types.js';
 import { store, type WorkspaceState } from '../store.js';
-import { composerBlock, dayAndClock } from '../view.js';
+import { composerBlock, composerPlaceholder, dayAndClock } from '../view.js';
 import { AutoTextarea, Button, Empty, PaneHeader } from './common.js';
 import { Markdown } from './Markdown.js';
 
@@ -126,7 +126,7 @@ export function Conversation({ state, onShowTask }: { state: WorkspaceState; onS
       >
         {conversation.length === 0 ? (
           <Empty title="Describe what you want built.">
-            Gemini will plan the work and propose one task at a time for Arena. Nothing is sent to Arena until you approve it.
+            Gemini plans the work and AgentLink carries each task to Arena and back by itself. Send the objective and it starts.
           </Empty>
         ) : (
           <ol class="entries">
@@ -162,7 +162,7 @@ export function Conversation({ state, onShowTask }: { state: WorkspaceState; onS
             maxRows={10}
             value={draft}
             disabled={blocked !== null}
-            placeholder={conversation.length === 0 ? 'What should this project achieve?' : 'Reply, redirect the work, or ask for the next step'}
+            placeholder={state.project ? composerPlaceholder(state.project, conversation.length === 0) : ''}
             onInput={(event) => setDraft((event.currentTarget as HTMLTextAreaElement).value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {

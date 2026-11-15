@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CompanionEvent } from '../../src/shared/api.js';
-import { renderArenaPrompt } from '../../src/shared/arenaPrompt.js';
+import { hasCompletionMarker } from '../../src/shared/arenaPrompt.js';
 import type { Companion } from '../../src/companion/app.js';
 import { OrchestratorError } from '../../src/companion/orchestration/orchestrator.js';
-import { errorBody, textResponse, toolResponse, VALID_KEY } from '../helpers/fakeGemini.js';
+import { errorBody, textResponse, toolResponse, VALID_KEY, type Scripted, type ScriptedOrFn } from '../helpers/fakeGemini.js';
 import { createHarness, waitFor, type Harness } from '../helpers/harness.js';
 
 let h: Harness;
@@ -20,7 +20,7 @@ const ARENA_REPLY = [
   'Ran `npm run build`: build completed without errors.',
 ].join('\n');
 
-const PROPOSAL = {
+const TASK = {
   title: 'Implement the login form',
   instructions: 'Create a LoginForm React component with email and password fields and client-side validation.',
   context: 'The repository is a Vite + React + TypeScript app. Components live in src/components.',
@@ -28,16 +28,48 @@ const PROPOSAL = {
   rationale: 'The login form is the first milestone and unblocks the session work.',
 };
 
-function newProject(c: Companion = h.companion): string {
-  return c.orchestrator.createProject({ name: 'Demo app', objective: 'Ship a working login flow', constraints: ['Do not add new runtime dependencies'] }).project.id;
+const NEXT_TASK = {
+  title: 'Add session handling',
+  instructions: 'Persist the signed-in user in a session cookie and restore it on reload.',
+  acceptance_criteria: ['`npm test` passes'],
+  rationale: 'The second milestone.',
+};
+
+const OBJECTIVE = { name: 'Demo app', objective: 'Ship a working login flow', constraints: ['Do not add new runtime dependencies'] };
+
+/** A turn in which Gemini sends a task to Arena. */
+function dispatches(args: Record<string, unknown> = TASK, text = 'Sent to Arena.'): ScriptedOrFn[] {
+  return [toolResponse([{ name: 'dispatch_arena_task', args }]), textResponse(text)];
 }
 
-async function say(id: string, text: string, c: Companion = h.companion): Promise<void> {
-  await c.orchestrator.sendMessage(id, text).done;
+/** A turn in which Gemini asks the user something, which is the only way a turn may end with nothing in motion. */
+function asks(question = 'Which stack does the app use?', options: string[] = []): ScriptedOrFn[] {
+  return [toolResponse([{ name: 'request_user_input', args: { question, why: 'It decides the first task.', options } }]), textResponse(question)];
+}
+
+function evaluates(taskId: string, verdict = 'complete', evidence: string[] = ['Ran `npm test`: 14 passed, 0 failed.']): Scripted {
+  return toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict, summary: 'Checked against the criteria.', evidence } }]);
+}
+
+function start(c: Companion = h.companion): string {
+  return c.orchestrator.createProject({ ...OBJECTIVE, start: true }).project.id;
 }
 
 function project(id: string, c: Companion = h.companion) {
   return c.orchestrator.getProject(id);
+}
+
+function task(id: string, taskId = 'T-1', c: Companion = h.companion) {
+  return c.orchestrator.getTask(id, taskId);
+}
+
+async function settle(id: string, c: Companion = h.companion): Promise<void> {
+  await c.orchestrator.whenIdle(id);
+}
+
+async function say(id: string, text: string, c: Companion = h.companion): Promise<void> {
+  await c.orchestrator.sendMessage(id, text).done;
+  await settle(id, c);
 }
 
 function rejection(fn: () => unknown): OrchestratorError {
@@ -50,704 +82,897 @@ function rejection(fn: () => unknown): OrchestratorError {
   throw new Error('Expected the operation to be refused.');
 }
 
-/** Drives a project to the point where a task has been proposed. */
-async function proposeTask(id: string, overrides: Record<string, unknown> = {}): Promise<string> {
-  h.fake.enqueue(toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, ...overrides } }]), textResponse('I have proposed the first task.'));
-  await say(id, 'Please get the login form built.');
-  const open = project(id).project.currentTaskId;
-  if (!open) throw new Error('No task was proposed.');
-  return open;
-}
-
-/** Approves and "delivers" a task the way the extension does. */
-function deliver(id: string, taskId: string): string {
-  const o = h.companion.orchestrator;
-  o.approveTask(id, taskId);
+/** Delivers the queued task the way the browser extension does. */
+function deliver(id: string, taskId = 'T-1', c: Companion = h.companion): string {
+  const o = c.orchestrator;
   const claim = o.claimDispatch(id, taskId, { tabId: 7, tabUrl: 'https://arena.ai/agent/abc' });
   o.confirmDispatch(id, taskId, claim.dispatchId);
   return claim.dispatchId;
 }
 
-describe('multi-turn conversation and persistent history', () => {
+/** Brings Arena's reply back the way the browser extension does. */
+function reply(id: string, taskId = 'T-1', text = ARENA_REPLY, c: Companion = h.companion): void {
+  const dispatchId = task(id, taskId, c).dispatch?.dispatchId ?? null;
+  c.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text, source: 'auto', completion: 'marker' });
+}
+
+/** Starts a project and lets it run until the first task is queued for Arena. */
+async function startedWithTask(): Promise<string> {
+  h.fake.enqueue(...dispatches());
+  const id = start();
+  await settle(id);
+  expect(task(id).status).toBe('queued');
+  return id;
+}
+
+function requestTexts(index: number): string {
+  const contents = h.fake.generateRequests[index]?.body.contents as { parts: { text?: string }[] }[];
+  return contents.map((c) => c.parts.map((p) => p.text ?? '').join('')).join('\n');
+}
+
+describe('the autonomous loop', () => {
+  it('starts from the objective alone and queues the first task for Arena without any approval', async () => {
+    h.fake.enqueue(
+      toolResponse([
+        { name: 'set_plan', args: { milestones: [{ title: 'Login form' }, { title: 'Sessions' }] } },
+        { name: 'dispatch_arena_task', args: TASK },
+      ]),
+      textResponse('Plan set; the first task is on its way to Arena.'),
+    );
+    const id = start();
+    await settle(id);
+
+    // The objective was the only input; no message from the user was needed.
+    expect(h.fake.generateRequests).toHaveLength(2);
+    expect(requestTexts(0)).toContain('Ship a working login flow');
+    const view = project(id);
+    expect(view.conversation.some((e) => e.role === 'user')).toBe(false);
+    expect(view.project.session.status).toBe('running');
+    expect(view.project.milestones.map((m) => m.title)).toEqual(['Login form', 'Sessions']);
+    expect(view.project.tasks).toHaveLength(1);
+    expect(view.project.tasks[0]).toMatchObject({ id: 'T-1', status: 'queued', title: TASK.title, acceptanceCriteria: TASK.acceptance_criteria });
+    expect(view.project.currentTaskId).toBe('T-1');
+
+    // The extension finds it as work to do straight away.
+    const work = h.companion.orchestrator.relayWork();
+    expect(work.items.map((i) => [i.projectId, i.task.id, i.task.status])).toEqual([[id, 'T-1', 'queued']]);
+  });
+
+  it('runs plan → send → reply → review → next task → … → complete with no user action in between', async () => {
+    const o = h.companion.orchestrator;
+    h.fake.enqueue(
+      toolResponse([
+        { name: 'set_plan', args: { milestones: [{ title: 'Login form' }, { title: 'Sessions' }] } },
+        { name: 'dispatch_arena_task', args: TASK },
+      ]),
+      textResponse('First task sent.'),
+    );
+    const id = start();
+    await settle(id);
+
+    // Round 1: the reply comes back; Gemini reviews it and sends the next task in the same turn.
+    deliver(id, 'T-1');
+    h.fake.enqueue(
+      evaluates('T-1'),
+      toolResponse([
+        { name: 'update_milestone', args: { milestone_id: 'M-1', status: 'done' } },
+        { name: 'dispatch_arena_task', args: NEXT_TASK },
+      ]),
+      textResponse('T-1 verified. T-2 sent.'),
+    );
+    reply(id, 'T-1');
+    await settle(id);
+    expect(task(id, 'T-1').status).toBe('completed');
+    expect(task(id, 'T-2').status).toBe('queued');
+    expect(project(id).project.session.status).toBe('running');
+
+    // Round 2: the last reply; Gemini declares the objective complete.
+    deliver(id, 'T-2');
+    h.fake.enqueue(
+      evaluates('T-2'),
+      toolResponse([
+        { name: 'update_milestone', args: { milestone_id: 'M-2', status: 'done' } },
+        { name: 'mark_objective_complete', args: { summary: 'Login form and sessions are built and tested.' } },
+      ]),
+      textResponse('Everything is done.'),
+    );
+    reply(id, 'T-2');
+    await settle(id);
+
+    const view = project(id);
+    expect(view.project.status).toBe('complete');
+    expect(view.project.session.status).toBe('completed');
+    expect(view.project.tasks.map((t) => t.status)).toEqual(['completed', 'completed']);
+    expect(view.conversation.filter((e) => e.role === 'user')).toHaveLength(0);
+    expect(o.relayWork().items).toEqual([]);
+    // Nothing more is asked of Gemini once the objective is complete.
+    const requests = h.fake.generateRequests.length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(h.fake.generateRequests).toHaveLength(requests);
+  });
+
+  it('prompts Gemini again by itself when a turn ends with nothing in motion', async () => {
+    h.fake.enqueue(textResponse('Let me think about the plan.'), ...dispatches());
+    const id = start();
+    await settle(id);
+
+    expect(task(id).status).toBe('queued');
+    // Turn 1 ended idle, so AgentLink told Gemini to act; no user message was involved.
+    expect(requestTexts(1)).toContain('[AgentLink]');
+    expect(project(id).conversation.some((e) => e.role === 'user')).toBe(false);
+  });
+
+  it('hands control back with a reason when Gemini keeps ending turns without acting', async () => {
+    const id = start();
+    await settle(id);
+
+    const session = project(id).project.session;
+    expect(session.status).toBe('blocked');
+    expect(session.blocker).toMatchObject({ kind: 'coordinator' });
+    expect(session.blocker?.detail).toContain('OK.');
+    // It tried three times, then stopped spending requests.
+    expect(h.fake.generateRequests).toHaveLength(3);
+    expect(project(id).conversation.at(-1)).toMatchObject({ role: 'system' });
+
+    // "Continue" prompts it again.
+    h.fake.enqueue(...dispatches());
+    h.companion.orchestrator.controlSession(id, 'resume');
+    await settle(id);
+    expect(project(id).project.session).toMatchObject({ status: 'running', blocker: null });
+    expect(task(id).status).toBe('queued');
+  });
+
+  it('stops for the user only when Gemini asks a real question, and continues on the answer', async () => {
+    h.fake.enqueue(...asks('Should sign-in use email or a username?', ['Email', 'Username']));
+    const id = start();
+    await settle(id);
+
+    let session = project(id).project.session;
+    expect(session.status).toBe('blocked');
+    expect(session.blocker).toMatchObject({ kind: 'question', title: 'Should sign-in use email or a username?', options: ['Email', 'Username'] });
+    expect(h.fake.generateRequests).toHaveLength(2);
+
+    h.fake.enqueue(...dispatches());
+    await say(id, 'Email');
+    session = project(id).project.session;
+    expect(session).toMatchObject({ status: 'running', blocker: null });
+    expect(task(id).status).toBe('queued');
+    expect(requestTexts(2)).toContain('Email');
+  });
+
+  it('continuing without answering tells Gemini to decide for itself', async () => {
+    h.fake.enqueue(...asks());
+    const id = start();
+    await settle(id);
+
+    h.fake.enqueue(...dispatches());
+    h.companion.orchestrator.controlSession(id, 'resume');
+    await settle(id);
+    expect(requestTexts(2)).toContain('without answering your question');
+    expect(task(id).status).toBe('queued');
+  });
+
+  it('does not let Gemini stop for the user while Arena is working', async () => {
+    h.fake.enqueue(
+      toolResponse([{ name: 'dispatch_arena_task', args: TASK }]),
+      toolResponse([{ name: 'request_user_input', args: { question: 'Shall I continue?', why: 'Checking in.' } }]),
+      textResponse('Waiting for Arena.'),
+    );
+    const id = start();
+    await settle(id);
+    expect(project(id).project.session.status).toBe('running');
+    const refused = project(id).conversation.flatMap((e) => e.actions).find((a) => a.name === 'request_user_input');
+    expect(refused?.ok).toBe(false);
+  });
+
+  it('accepts a message at any time and passes it to Gemini without stopping the work', async () => {
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.enqueue(textResponse('Noted; I will keep that in mind for the next task.'));
+    await say(id, 'Use Tailwind for styling from now on.');
+
+    expect(project(id).project.session.status).toBe('running');
+    expect(task(id).status).toBe('awaiting_response');
+    expect(requestTexts(2)).toContain('Use Tailwind for styling from now on.');
+    // The open task keeps the loop in motion, so no reminder turn follows.
+    expect(h.fake.generateRequests).toHaveLength(3);
+  });
+
+  it('queues a message that arrives while Gemini is still working, and answers both in order', async () => {
+    const id = await startedWithTask();
+    h.fake.enqueue(textResponse('slow answer', { pieces: 3, chunkDelayMs: 40 }), textResponse('second answer'));
+    const first = h.companion.orchestrator.sendMessage(id, 'one');
+    await waitFor(() => h.companion.orchestrator.turnState(id).active, 'the turn to start');
+    const second = h.companion.orchestrator.sendMessage(id, 'two');
+    await Promise.all([first.done, second.done]);
+    expect(
+      project(id)
+        .conversation.slice(-4)
+        .map((e) => e.text),
+    ).toEqual(['one', 'slow answer', 'two', 'second answer']);
+    expect(h.fake.generateRequests).toHaveLength(4);
+  });
+});
+
+describe('conversation and memory sent to Gemini', () => {
   it('streams the reply, stores the turn, and sends prior turns back on the next request', async () => {
-    const id = newProject();
+    const id = await startedWithTask();
     const events: CompanionEvent[] = [];
     h.companion.bus.subscribe((e) => events.push(e));
 
-    h.fake.enqueue(textResponse('Understood. What stack does the app use?', { pieces: 4 }));
-    await say(id, 'I want a login flow.');
+    h.fake.enqueue(textResponse('Understood. The login form comes first.', { pieces: 4 }));
+    await say(id, 'What are you doing right now?');
 
     const deltas = events.filter((e) => e.type === 'delta').map((e) => (e.type === 'delta' ? e.text : ''));
     expect(deltas.length).toBeGreaterThan(1);
-    expect(deltas.join('')).toBe('Understood. What stack does the app use?');
+    expect(deltas.join('')).toBe('Understood. The login form comes first.');
 
-    let view = project(id);
-    expect(view.conversation.map((e) => [e.role, e.status, e.text])).toEqual([
-      ['user', 'complete', 'I want a login flow.'],
-      ['coordinator', 'complete', 'Understood. What stack does the app use?'],
+    const view = project(id);
+    expect(view.conversation.slice(-2).map((e) => [e.role, e.status, e.text])).toEqual([
+      ['user', 'complete', 'What are you doing right now?'],
+      ['coordinator', 'complete', 'Understood. The login form comes first.'],
     ]);
-    expect(view.conversation[1]?.usage).toEqual({ promptTokens: 100, outputTokens: 25, totalTokens: 125 });
-    expect(view.project.session.status).toBe('running');
+    expect(view.conversation.at(-1)?.usage).toEqual({ promptTokens: 100, outputTokens: 25, totalTokens: 125 });
 
-    h.fake.enqueue(textResponse('React it is.'));
-    await say(id, 'React with TypeScript.');
-    const second = h.fake.lastGenerate().body;
-    expect(second.contents.map((c: any) => c.role)).toEqual(['user', 'model', 'user']);
-    expect(second.contents[0].parts[0].text).toBe('I want a login flow.');
-    expect(second.contents[1].parts.map((p: any) => p.text).join('')).toBe('Understood. What stack does the app use?');
+    const sent = h.fake.lastGenerate().body.contents as { role: string; parts: Record<string, unknown>[] }[];
+    // Kick-off, the model's tool call, the tool result, the model's text, then the user's message.
+    expect(sent.map((c) => c.role)).toEqual(['user', 'model', 'user', 'model', 'user']);
+    expect(sent[1]?.parts.some((p) => 'functionCall' in p)).toBe(true);
     // The model's own parts, including the thought signature, are replayed unchanged.
-    expect(second.contents[1].parts.some((p: any) => p.thoughtSignature === 'sig-text')).toBe(true);
-    expect(second.contents[2].parts[0].text).toBe('React with TypeScript.');
-
-    view = project(id);
-    expect(view.conversation).toHaveLength(4);
+    expect(sent[3]?.parts.some((p) => p.thoughtSignature === 'sig-text')).toBe(true);
+    expect(sent[4]?.parts[0]?.text).toBe('What are you doing right now?');
   });
 
-  it('gives Gemini the coordinator role and the current project memory on every request', async () => {
-    const id = newProject();
-    h.fake.enqueue(textResponse('ok'));
-    await say(id, 'hi');
-    const system = h.fake.lastGenerate().body.systemInstruction.parts[0].text as string;
+  it('gives Gemini the coordinator role, the autonomy rules and the current project memory on every request', async () => {
+    const id = await startedWithTask();
+    void id;
+    const body = h.fake.lastGenerate().body;
+    const system = body.systemInstruction.parts[0].text as string;
     expect(system).toContain('You are the AgentLink Coordinator');
     expect(system).toContain('# PROJECT MEMORY');
     expect(system).toContain('Project: Demo app');
     expect(system).toContain('Objective: Ship a working login flow');
     expect(system).toContain('Do not add new runtime dependencies');
-    const names = h.fake.lastGenerate().body.tools[0].functionDeclarations.map((f: any) => f.name);
-    expect(names).toEqual(expect.arrayContaining(['set_plan', 'propose_arena_task', 'evaluate_arena_result', 'record_decision', 'record_issue', 'mark_objective_complete']));
-  });
-
-  it('refuses a second message while the coordinator is still working', async () => {
-    const id = newProject();
-    h.fake.enqueue(textResponse('slow answer', { pieces: 3, chunkDelayMs: 40 }));
-    const first = h.companion.orchestrator.sendMessage(id, 'one');
-    expect(rejection(() => h.companion.orchestrator.sendMessage(id, 'two')).code).toBe('coordinator_busy');
-    await first.done;
-    expect(h.fake.generateRequests).toHaveLength(1);
-  });
-
-  it('records a failed request as an error entry and keeps the history valid for the next turn', async () => {
-    const id = newProject();
-    h.fake.enqueue({ kind: 'error', status: 400, body: errorBody(400, 'INVALID_ARGUMENT', 'Something was wrong.') });
-    await say(id, 'first try');
-    const failed = project(id).conversation.at(-1);
-    expect(failed).toMatchObject({ role: 'coordinator', status: 'error' });
-    expect(failed?.error).toContain('Something was wrong.');
-
-    h.fake.enqueue(textResponse('Second time lucky.'));
-    await say(id, 'second try');
-    const contents = h.fake.lastGenerate().body.contents;
-    expect(contents.map((c: any) => c.role)).toEqual(['user', 'model', 'user']);
-    expect(project(id).conversation.at(-1)?.text).toBe('Second time lucky.');
+    expect(system).not.toMatch(/wait(s|ing)? for (the user's|your|user) approval/i);
+    const names = body.tools[0].functionDeclarations.map((f: { name: string }) => f.name);
+    expect(names).toEqual(expect.arrayContaining(['set_plan', 'dispatch_arena_task', 'evaluate_arena_result', 'record_decision', 'record_issue', 'request_user_input', 'mark_objective_complete']));
+    expect(names).not.toContain('propose_arena_task');
   });
 
   it('refuses to start without an API key instead of pretending to work', async () => {
     const bare = await createHarness({ saveKey: null });
     try {
-      const id = bare.companion.orchestrator.createProject({ name: 'P', objective: 'O' }).project.id;
-      expect(rejection(() => bare.companion.orchestrator.sendMessage(id, 'hello')).code).toBe('gemini_not_configured');
-      expect(bare.fake.requests).toHaveLength(0);
+      const o = bare.companion.orchestrator;
+      const id = o.createProject({ ...OBJECTIVE, start: true }).project.id;
+      // The project exists, but nothing claims to be running.
+      expect(o.getProject(id).project.session.status).toBe('idle');
+      expect(rejection(() => o.sendMessage(id, 'hello')).code).toBe('gemini_not_configured');
+      expect(rejection(() => o.controlSession(id, 'start')).code).toBe('gemini_not_configured');
+      expect(bare.fake.generateRequests).toHaveLength(0);
     } finally {
       await bare.cleanup();
     }
   });
 
   it('never stores the API key if the user pastes it into the conversation', async () => {
-    const id = newProject();
-    h.fake.enqueue(textResponse('Do not share keys.'));
-    await say(id, `my key is ${VALID_KEY} ok?`);
-    expect(JSON.stringify(h.companion.store.get(id))).not.toContain(VALID_KEY);
+    const id = await startedWithTask();
+    h.fake.enqueue(textResponse('Thanks.'));
+    await say(id, `my key is ${VALID_KEY} please use it`);
+    const stored = JSON.stringify(project(id));
+    expect(stored).not.toContain(VALID_KEY);
     expect(JSON.stringify(h.fake.lastGenerate().body)).not.toContain(VALID_KEY);
+  });
+
+  it('lets the user change the objective at any time and tells Gemini about it', async () => {
+    const id = await startedWithTask();
+    h.companion.orchestrator.updateProject(id, { objective: 'Ship login and password reset' });
+    h.fake.enqueue(textResponse('Understood.'));
+    await say(id, 'Carry on.');
+    expect(requestTexts(2)).toContain('Ship login and password reset');
+    const system = h.fake.lastGenerate().body.systemInstruction.parts[0].text as string;
+    expect(system).toContain('Objective: Ship login and password reset');
+  });
+
+  it('stops tool loops after the configured number of rounds', async () => {
+    h.companion.settings.update({ maxToolRounds: 2 });
+    h.fake.fallback = () => toolResponse([{ name: 'record_decision', args: { summary: `Decision ${Math.random()}` } }]);
+    h.fake.enqueue(...dispatches());
+    const id = start();
+    await settle(id);
+    const before = h.fake.generateRequests.length;
+    const turn = h.companion.orchestrator.sendMessage(id, 'Record decisions.');
+    h.fake.fallback = () => toolResponse([{ name: 'record_decision', args: { summary: `Decision ${Math.random()}` } }]);
+    await turn.done;
+    // Two tool rounds, then one last round in which calling tools is switched off.
+    expect(h.fake.generateRequests.length - before).toBe(3);
+    expect(h.fake.lastGenerate().body.toolConfig.functionCallingConfig.mode).toBe('NONE');
   });
 });
 
-describe('task generation and user approval', () => {
-  it('turns a Gemini proposal into a structured task that waits for approval', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const view = project(id);
-    const task = view.project.tasks[0];
-    expect(task).toMatchObject({
-      id: 'T-1',
-      status: 'proposed',
-      title: PROPOSAL.title,
-      instructions: PROPOSAL.instructions,
-      context: PROPOSAL.context,
-      acceptanceCriteria: PROPOSAL.acceptance_criteria,
-      rationale: PROPOSAL.rationale,
-      dispatch: null,
-      arenaResponse: null,
-    });
-    expect(taskId).toBe('T-1');
-    expect(view.conversation.at(-1)?.actions).toEqual([{ name: 'propose_arena_task', ok: true, summary: 'Proposed T-1: Implement the login form' }]);
-    expect(view.conversation.at(-1)?.text).toBe('I have proposed the first task.');
+describe('sending tasks to Arena', () => {
+  it('sends exactly the stored task, with the project constraints and a completion line Arena must end with', async () => {
+    const id = await startedWithTask();
+    const claim = h.companion.orchestrator.claimDispatch(id, 'T-1', { tabId: 7, tabUrl: 'https://arena.ai/agent/abc' });
 
-    // The tool result went back to Gemini with the id of the call it answers.
-    const followUp = h.fake.lastGenerate().body.contents;
-    const call = followUp.at(-2).parts.find((p: any) => p.functionCall);
-    const response = followUp.at(-1).parts[0].functionResponse;
-    expect(response.id).toBe(call.functionCall.id);
-    expect(response.name).toBe('propose_arena_task');
-    expect(response.response).toMatchObject({ ok: true, task_id: 'T-1', status: 'proposed' });
-    expect(call.thoughtSignature).toBeTruthy();
-  });
-
-  it('does not hand anything to Arena before the user approves', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const refused = rejection(() => h.companion.orchestrator.claimDispatch(id, taskId));
-    expect(refused.code).toBe('not_dispatchable');
-    expect(refused.message).toContain('has not been approved');
-    expect(project(id).project.tasks[0]?.status).toBe('proposed');
-    expect(project(id).project.session.tasksDispatched).toBe(0);
-  });
-
-  it('sends exactly the approved text, including project constraints', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    h.companion.orchestrator.approveTask(id, taskId);
-    const claim = h.companion.orchestrator.claimDispatch(id, taskId, { tabId: 3, tabUrl: 'https://arena.ai/x' });
-    const task = project(id).project.tasks[0]!;
-    expect(claim.prompt).toBe(renderArenaPrompt({ task, projectName: 'Demo app', constraints: ['Do not add new runtime dependencies'] }));
     expect(claim.prompt).toContain('# Task T-1: Implement the login form');
-    expect(claim.prompt).toContain('- `npm test` passes');
-    expect(claim.prompt).toContain('- Do not add new runtime dependencies');
-    expect(claim.prompt).not.toContain(PROPOSAL.rationale);
-    expect(task.status).toBe('dispatching');
-    expect(task.dispatch).toMatchObject({ attempt: 1, tabId: 3, tabUrl: 'https://arena.ai/x', unconfirmed: false });
+    expect(claim.prompt).toContain(TASK.instructions);
+    expect(claim.prompt).toContain(TASK.context);
+    for (const criterion of TASK.acceptance_criteria) expect(claim.prompt).toContain(criterion);
+    expect(claim.prompt).toContain('Do not add new runtime dependencies');
+    const ref = claim.task.dispatch?.ref ?? '';
+    expect(ref).toMatch(/^AL-T-1-[a-z0-9]{8}$/);
+    expect(claim.prompt).toContain(ref);
+    expect(claim.prompt).toContain('AGENTLINK-DONE');
+    // The prompt describes the closing line without containing it, so only Arena's reply can match.
+    expect(hasCompletionMarker(claim.prompt, ref)).toBe(false);
+    expect(hasCompletionMarker(`All done.\nAGENTLINK-DONE ${ref}`, ref)).toBe(true);
+    expect(task(id).dispatch?.prompt).toBe(claim.prompt);
   });
 
-  it('lets the user edit a proposed task, and the edit is what gets sent', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const edited = h.companion.orchestrator.editTask(id, taskId, {
-      title: 'Implement the login form (email only)',
-      instructions: 'Create a LoginForm with an email field only.',
-      acceptanceCriteria: ['`npm test` passes'],
-    });
-    expect(edited).toMatchObject({ editedByUser: true, status: 'proposed', title: 'Implement the login form (email only)' });
-    h.companion.orchestrator.approveTask(id, taskId);
-    const { prompt } = h.companion.orchestrator.claimDispatch(id, taskId);
-    expect(prompt).toContain('Create a LoginForm with an email field only.');
-    expect(prompt).not.toContain('password fields');
-    expect(rejection(() => h.companion.orchestrator.editTask(id, taskId, { title: 'too late' })).code).toBe('invalid_state');
+  it('hands a task out for delivery exactly once', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    const claim = o.claimDispatch(id, 'T-1');
+    expect(task(id).status).toBe('dispatching');
+    expect(rejection(() => o.claimDispatch(id, 'T-1')).code).toBe('not_dispatchable');
+
+    o.confirmDispatch(id, 'T-1', claim.dispatchId);
+    expect(task(id).status).toBe('awaiting_response');
+    expect(rejection(() => o.claimDispatch(id, 'T-1')).code).toBe('not_dispatchable');
+    expect(project(id).project.session.tasksDispatched).toBe(1);
+    // Confirming again changes nothing.
+    o.confirmDispatch(id, 'T-1', claim.dispatchId);
+    expect(project(id).project.session.tasksDispatched).toBe(1);
+    expect(rejection(() => o.confirmDispatch(id, 'T-1', 'someone-else')).code).toBe('stale_dispatch');
   });
 
-  it('lets the user reject a task; a reason is passed to Gemini for a revised proposal', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    h.fake.enqueue(toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, title: 'Implement passwordless login', instructions: 'Build a magic-link login form.' } }]), textResponse('Revised.'));
-    const rejected = h.companion.orchestrator.rejectTask(id, taskId, 'We do not want passwords at all.');
-    expect(rejected.status).toBe('rejected');
-    await h.companion.orchestrator.whenIdle(id);
+  it('puts a task back in the queue when delivery definitely failed, and sends it again by itself', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    const first = o.claimDispatch(id, 'T-1');
+    const firstRef = first.task.dispatch?.ref;
+    o.failDispatch(id, 'T-1', { dispatchId: first.dispatchId, error: 'The Arena message box was not found.', submitted: false });
 
-    const feedback = h.fake.generateRequests.at(-2)!.body.contents.at(-1).parts[0].text as string;
-    expect(feedback).toContain('[AgentLink] The user rejected task T-1');
-    expect(feedback).toContain('We do not want passwords at all.');
-    const view = project(id);
-    expect(view.project.tasks.map((t) => [t.id, t.status])).toEqual([
-      ['T-1', 'rejected'],
-      ['T-2', 'proposed'],
-    ]);
-    expect(rejection(() => h.companion.orchestrator.claimDispatch(id, 'T-1')).code).toBe('not_dispatchable');
+    expect(task(id)).toMatchObject({ status: 'queued' });
+    expect(task(id).dispatch?.error).toBe('The Arena message box was not found.');
+    expect(o.relayWork().items.map((i) => i.task.status)).toEqual(['queued']);
+    // Gemini is not involved: this is a delivery matter.
+    expect(h.fake.generateRequests).toHaveLength(2);
+
+    const second = o.claimDispatch(id, 'T-1');
+    expect(second.dispatchId).not.toBe(first.dispatchId);
+    expect(second.task.dispatch?.attempt).toBe(2);
+    // A new attempt carries a new reference, so the two can never be confused in the page.
+    expect(second.task.dispatch?.ref).not.toBe(firstRef);
+    expect(rejection(() => o.confirmDispatch(id, 'T-1', first.dispatchId)).code).toBe('stale_dispatch');
   });
 
-  it('rejecting without a reason does not call Gemini, but the next turn is told about it', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const before = h.fake.generateRequests.length;
-    h.companion.orchestrator.rejectTask(id, taskId);
-    await h.companion.orchestrator.whenIdle(id);
-    expect(h.fake.generateRequests).toHaveLength(before);
+  it('never re-sends while delivery is uncertain; it is re-sent only once the page shows it never arrived', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    const claim = o.claimDispatch(id, 'T-1');
+    o.failDispatch(id, 'T-1', { dispatchId: claim.dispatchId, error: 'Arena did not acknowledge the task.', submitted: 'unknown' });
 
-    h.fake.enqueue(textResponse('What would you like instead?'));
-    await say(id, 'ok');
-    const text = h.fake.lastGenerate().body.contents.at(-1).parts[0].text as string;
-    expect(text).toContain('[AgentLink] The user rejected task T-1');
-    expect(text.endsWith('ok')).toBe(true);
+    expect(task(id).status).toBe('awaiting_response');
+    expect(task(id).dispatch?.unconfirmed).toBe(true);
+    expect(rejection(() => o.claimDispatch(id, 'T-1')).code).toBe('not_dispatchable');
+
+    // Either the extension finds it in the page …
+    o.confirmDispatch(id, 'T-1', claim.dispatchId);
+    expect(task(id).dispatch?.unconfirmed).toBe(false);
+    expect(rejection(() => o.resetDispatch(id, 'T-1', { dispatchId: claim.dispatchId, reason: 'x' })).code).toBe('invalid_state');
+  });
+
+  it('re-queues an unconfirmed delivery that the page shows never arrived', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    const claim = o.claimDispatch(id, 'T-1');
+    o.failDispatch(id, 'T-1', { dispatchId: claim.dispatchId, error: 'Arena did not acknowledge the task.', submitted: 'unknown' });
+    expect(project(id).project.session.tasksDispatched).toBe(1);
+
+    expect(rejection(() => o.resetDispatch(id, 'T-1', { dispatchId: 'other', reason: 'x' })).code).toBe('stale_dispatch');
+    o.resetDispatch(id, 'T-1', { dispatchId: claim.dispatchId, reason: 'The task is not in the Arena conversation.' });
+    expect(task(id).status).toBe('queued');
+    expect(project(id).project.session.tasksDispatched).toBe(0);
+    expect(o.claimDispatch(id, 'T-1').task.dispatch?.attempt).toBe(2);
+  });
+
+  it('stops retrying a delivery Arena keeps refusing and says why', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const claim = o.claimDispatch(id, 'T-1');
+      o.failDispatch(id, 'T-1', { dispatchId: claim.dispatchId, error: 'Arena refused the text.', submitted: false });
+    }
+    expect(rejection(() => o.claimDispatch(id, 'T-1')).code).toBe('dispatch_attempts_exhausted');
+    const session = project(id).project.session;
+    expect(session.status).toBe('blocked');
+    expect(session.blocker).toMatchObject({ kind: 'arena', taskId: 'T-1' });
+    expect(session.blocker?.detail).toContain('Arena refused the text.');
+    // Blocked means nothing is typed into Arena.
+    expect(o.relayWork().items).toEqual([]);
+
+    // Continuing gives it a fresh set of attempts.
+    o.controlSession(id, 'resume');
+    expect(o.claimDispatch(id, 'T-1').task.dispatch?.attempt).toBe(1);
   });
 
   it('allows only one open task at a time and tells Gemini why', async () => {
-    const id = newProject();
-    await proposeTask(id);
-    h.fake.enqueue(toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, title: 'Another', instructions: 'Something else entirely.' } }]), textResponse('I will wait.'));
-    await say(id, 'propose another one too');
-    const view = project(id);
-    expect(view.project.tasks).toHaveLength(1);
-    expect(view.conversation.at(-1)?.actions[0]).toMatchObject({ name: 'propose_arena_task', ok: false });
-    const response = h.fake.lastGenerate().body.contents.at(-1).parts[0].functionResponse.response;
-    expect(response.ok).toBe(false);
-    expect(response.error).toContain('T-1');
-    expect(response.error).toContain('Only one task may be open');
+    h.fake.enqueue(
+      toolResponse([{ name: 'dispatch_arena_task', args: TASK }]),
+      toolResponse([{ name: 'dispatch_arena_task', args: NEXT_TASK }]),
+      textResponse('One at a time, then.'),
+    );
+    const id = start();
+    await settle(id);
+    expect(project(id).project.tasks.map((t) => t.id)).toEqual(['T-1']);
+    const actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'dispatch_arena_task');
+    expect(actions.map((a) => a.ok)).toEqual([true, false]);
+    expect(actions[1]?.summary).toContain('still open');
   });
 
-  it('refuses proposals with no checkable acceptance criteria', async () => {
-    const id = newProject();
-    h.fake.enqueue(toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, acceptance_criteria: [] } }]), textResponse('Let me fix that.'));
-    await say(id, 'go');
-    expect(project(id).project.tasks).toHaveLength(0);
-    expect(project(id).conversation.at(-1)?.actions[0]?.ok).toBe(false);
+  it('refuses tasks with no checkable acceptance criteria', async () => {
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: { ...TASK, acceptance_criteria: [] } }]), ...dispatches());
+    const id = start();
+    await settle(id);
+    const actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'dispatch_arena_task');
+    expect(actions.map((a) => a.ok)).toEqual([false, true]);
+    expect(project(id).project.tasks).toHaveLength(1);
+  });
+
+  it('refuses a task identical to one that was already sent', async () => {
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.enqueue(evaluates('T-1', 'failed', []), toolResponse([{ name: 'dispatch_arena_task', args: TASK }]), ...dispatches({ ...TASK, instructions: `${TASK.instructions} The previous attempt left the tests failing; fix them.` }));
+    reply(id, 'T-1', 'I could not get the tests to pass.');
+    await settle(id);
+
+    const actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'dispatch_arena_task');
+    expect(actions.map((a) => a.ok)).toEqual([true, false, true]);
+    expect(actions[1]?.summary).toContain('identical');
+    expect(project(id).project.tasks.map((t) => [t.id, t.status])).toEqual([
+      ['T-1', 'failed'],
+      ['T-2', 'queued'],
+    ]);
+  });
+
+  it('pauses for the user at the task safety limit, and carries on after "Continue"', async () => {
+    h.companion.settings.update({ maxTasksPerSession: 1 });
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.enqueue(evaluates('T-1'), toolResponse([{ name: 'dispatch_arena_task', args: NEXT_TASK }]), textResponse('The safety limit is reached.'));
+    reply(id);
+    await settle(id);
+
+    const session = project(id).project.session;
+    expect(session.status).toBe('blocked');
+    expect(session.blocker?.kind).toBe('task_budget');
+    expect(project(id).project.tasks).toHaveLength(1);
+
+    h.fake.enqueue(...dispatches(NEXT_TASK));
+    h.companion.orchestrator.controlSession(id, 'resume');
+    await settle(id);
+    expect(project(id).project.session).toMatchObject({ status: 'running', tasksDispatched: 0 });
+    expect(task(id, 'T-2').status).toBe('queued');
   });
 });
 
-describe('Arena communication and duplicate prevention', () => {
-  it('hands a task out for delivery exactly once', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+describe('receiving Arena replies', () => {
+  it('records a reply once, for a task that is waiting for one, and starts the review by itself', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
-    o.approveTask(id, taskId);
-    const claim = o.claimDispatch(id, taskId);
+    expect(rejection(() => o.recordArenaResponse(id, 'T-1', { dispatchId: null, text: ARENA_REPLY, source: 'auto' })).code).toBe('invalid_state');
 
-    const second = rejection(() => o.claimDispatch(id, taskId));
-    expect(second.code).toBe('not_dispatchable');
-    expect(second.message).toContain('already been handed to Arena');
+    const dispatchId = deliver(id);
+    expect(rejection(() => o.recordArenaResponse(id, 'T-1', { dispatchId: 'wrong', text: ARENA_REPLY, source: 'auto' })).code).toBe('stale_dispatch');
 
-    o.confirmDispatch(id, taskId, claim.dispatchId);
-    expect(rejection(() => o.claimDispatch(id, taskId)).code).toBe('not_dispatchable');
-    // Confirming again is harmless and does not count the task twice.
-    o.confirmDispatch(id, taskId, claim.dispatchId);
-    const view = project(id);
-    expect(view.project.tasks[0]?.status).toBe('awaiting_response');
-    expect(view.project.session.tasksDispatched).toBe(1);
-    expect(view.project.timeline.filter((e) => e.title === 'Task T-1 sent to Arena')).toHaveLength(1);
+    h.fake.enqueue(evaluates('T-1'), ...dispatches(NEXT_TASK));
+    const recorded = o.recordArenaResponse(id, 'T-1', { dispatchId, text: ARENA_REPLY, source: 'auto', completion: 'marker' });
+    expect(recorded.arenaResponse).toMatchObject({ text: ARENA_REPLY, chars: ARENA_REPLY.length, source: 'auto', completion: 'marker', truncated: false });
+    expect(rejection(() => o.recordArenaResponse(id, 'T-1', { dispatchId, text: 'again', source: 'auto' })).code).toBe('response_already_recorded');
+
+    await settle(id);
+    expect(task(id).status).toBe('completed');
+    expect(task(id).arenaResponse?.text).toBe(ARENA_REPLY);
   });
 
-  it('approving twice is idempotent and does not create a second delivery', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+  it('accepts a reply for a delivery that was never confirmed, because the reply proves it arrived', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
-    o.approveTask(id, taskId);
-    o.approveTask(id, taskId);
-    expect(project(id).project.timeline.filter((e) => e.title === 'Task T-1 approved by you')).toHaveLength(1);
+    const claim = o.claimDispatch(id, 'T-1');
+    o.failDispatch(id, 'T-1', { dispatchId: claim.dispatchId, error: 'No acknowledgement.', submitted: 'unknown' });
+    h.fake.enqueue(evaluates('T-1'), ...dispatches(NEXT_TASK));
+    o.recordArenaResponse(id, 'T-1', { dispatchId: claim.dispatchId, text: ARENA_REPLY, source: 'auto', completion: 'quiet' });
+    expect(task(id).dispatch?.unconfirmed).toBe(false);
+    await settle(id);
+    expect(task(id).status).toBe('completed');
   });
 
-  it('returns the task to "approved" when delivery definitely failed, and allows a retry', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+  it('tells Gemini when a reply may be incomplete', async () => {
+    const id = await startedWithTask();
+    const dispatchId = deliver(id);
+    h.fake.enqueue(evaluates('T-1', 'unclear', []), ...dispatches(NEXT_TASK));
+    h.companion.orchestrator.recordArenaResponse(id, 'T-1', { dispatchId, text: 'I started on the form and', source: 'auto', completion: 'stalled' });
+    await settle(id);
+    expect(requestTexts(2)).toMatch(/may be incomplete|possibly incomplete|did not finish/i);
+    expect(task(id).status).toBe('inconclusive');
+  });
+
+  it('closes a task Arena never answered as "no reply" — never as done — and lets Gemini decide', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
-    o.approveTask(id, taskId);
-    const first = o.claimDispatch(id, taskId);
-    const failed = o.failDispatch(id, taskId, { dispatchId: first.dispatchId, error: 'No Arena tab is open.', submitted: false });
-    expect(failed.status).toBe('approved');
-    expect(failed.dispatch?.error).toBe('No Arena tab is open.');
-    expect(project(id).project.session.tasksDispatched).toBe(0);
+    const dispatchId = deliver(id);
+    expect(rejection(() => o.recordNoResponse(id, 'T-1', { dispatchId: 'wrong', reason: 'x' })).code).toBe('stale_dispatch');
 
-    const retry = o.claimDispatch(id, taskId);
-    expect(retry.dispatchId).not.toBe(first.dispatchId);
-    expect(project(id).project.tasks[0]?.dispatch?.attempt).toBe(2);
-    // The stale first attempt can no longer confirm anything.
-    expect(rejection(() => o.confirmDispatch(id, taskId, first.dispatchId)).code).toBe('stale_dispatch');
+    h.fake.enqueue(...dispatches({ ...TASK, title: 'Implement the login form (second try)' }));
+    o.recordNoResponse(id, 'T-1', { dispatchId, reason: 'Arena showed the task but wrote nothing for 5 minutes.' });
+    await settle(id);
+
+    expect(task(id)).toMatchObject({ status: 'no_response', evaluation: null });
+    expect(task(id).closedReason).toContain('wrote nothing');
+    expect(requestTexts(2)).toContain('Arena did not reply to task T-1');
+    expect(task(id, 'T-2').status).toBe('queued');
+    expect(project(id).project.session.status).toBe('running');
   });
 
-  it('never re-sends when delivery is uncertain; only the user can declare it not sent', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+  it('stops and asks for help when Arena answers nothing several times in a row', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
-    o.approveTask(id, taskId);
-    const claim = o.claimDispatch(id, taskId);
-    const uncertain = o.failDispatch(id, taskId, { dispatchId: claim.dispatchId, error: 'Could not confirm submission.', submitted: 'unknown' });
-    expect(uncertain.status).toBe('awaiting_response');
-    expect(uncertain.dispatch?.unconfirmed).toBe(true);
-    expect(rejection(() => o.claimDispatch(id, taskId)).code).toBe('not_dispatchable');
-
-    expect(o.resetDispatch(id, taskId).status).toBe('approved');
-    expect(o.claimDispatch(id, taskId).dispatchId).not.toBe(claim.dispatchId);
+    for (let n = 1; n <= 3; n += 1) {
+      const taskId = `T-${n}`;
+      const dispatchId = deliver(id, taskId);
+      if (n < 3) h.fake.enqueue(...dispatches({ ...TASK, title: `Attempt ${n + 1}` }));
+      o.recordNoResponse(id, taskId, { dispatchId, reason: 'Arena wrote nothing.' });
+      await settle(id);
+    }
+    const session = project(id).project.session;
+    expect(session.status).toBe('blocked');
+    expect(session.blocker).toMatchObject({ kind: 'arena', title: 'Arena is not answering' });
+    expect(project(id).project.tasks.map((t) => t.status)).toEqual(['no_response', 'no_response', 'no_response']);
   });
 
-  it('refuses a proposal identical to a task that was already sent', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
-    h.fake.enqueue(
-      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'failed', summary: 'Nothing was done.', evidence: [] } }]),
-      // Gemini tries to send the very same task again.
-      toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL } }]),
-      textResponse('I need to rethink the task.'),
-    );
-    h.companion.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text: 'I could not find the repository.', source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
-
-    const view = project(id);
-    expect(view.project.tasks.map((t) => t.status)).toEqual(['failed']);
-    const actions = view.conversation.at(-1)!.actions;
-    expect(actions[1]).toMatchObject({ name: 'propose_arena_task', ok: false });
-    expect(actions[1]?.summary).toContain('identical to T-1');
-  });
-
-  it('records an Arena reply only once and only for a task that is waiting for one', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+  it('reports what the relay is doing, and records only real changes as events', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
-    expect(rejection(() => o.recordArenaResponse(id, taskId, { text: ARENA_REPLY, source: 'pasted' })).code).toBe('invalid_state');
+    o.reportRelay(id, 'T-1', { phase: 'waiting_for_arena', message: 'No Arena tab is open.', attention: true, chars: 0 });
+    expect(task(id).relay).toMatchObject({ phase: 'waiting_for_arena', attention: true, message: 'No Arena tab is open.' });
+    const events = () => project(id).project.timeline.filter((e) => e.title.includes('Arena needs attention')).length;
+    expect(events()).toBe(1);
+    o.reportRelay(id, 'T-1', { phase: 'waiting_for_arena', message: 'No Arena tab is open.', attention: true, chars: 0 });
+    expect(events()).toBe(1);
 
-    const dispatchId = deliver(id, taskId);
-    expect(rejection(() => o.recordArenaResponse(id, taskId, { dispatchId: 'other', text: ARENA_REPLY, source: 'auto' })).code).toBe('stale_dispatch');
-    expect(rejection(() => o.recordArenaResponse(id, taskId, { dispatchId, text: '   ', source: 'auto' })).httpStatus).toBe(400);
-
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'unclear', summary: 'n/a', evidence: [] } }]), textResponse('Noted.'));
-    o.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    expect(rejection(() => o.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' })).code).toBe('response_already_recorded');
-    await o.whenIdle(id);
-    expect(h.fake.generateRequests.filter((r) => JSON.stringify(r.body).includes('ARENA_RESPONSE_BEGIN'))).not.toHaveLength(0);
-    expect(project(id).project.timeline.filter((e) => e.title === 'Arena replied to T-1')).toHaveLength(1);
+    const dispatchId = deliver(id);
+    o.reportRelay(id, 'T-1', { dispatchId, phase: 'generating', message: 'Arena is writing.', attention: false, chars: 420 });
+    expect(task(id).relay).toMatchObject({ phase: 'generating', chars: 420, attention: false });
+    // A report about an older delivery attempt is ignored.
+    o.reportRelay(id, 'T-1', { dispatchId: 'old', phase: 'stalled', message: 'stale', attention: true, chars: 1 });
+    expect(task(id).relay?.phase).toBe('generating');
+    expect(rejection(() => o.reportRelay(id, 'T-1', { phase: 'nonsense' as never, message: '', attention: false, chars: 0 })).code).toBe('invalid_request');
   });
 
-  it('pauses the session when the task budget is used up, and continues after a resume', async () => {
-    h.companion.settings.update({ maxTasksPerSession: 1 });
-    const id = newProject();
-    const first = await proposeTask(id);
-    const dispatchId = deliver(id, first);
-    h.fake.enqueue(
-      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: first, verdict: 'partial', summary: 'Tests pass, build not shown.', evidence: ['14 passed, 0 failed'] } }]),
-      toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, title: 'Run the build', instructions: 'Run npm run build and report the output.' } }]),
-      textResponse('Budget reached.'),
-    );
-    h.companion.orchestrator.recordArenaResponse(id, first, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
-    // Gemini is told the limit was reached instead of being allowed to queue more work.
-    expect(project(id).conversation.at(-1)?.actions[1]).toMatchObject({ name: 'propose_arena_task', ok: false });
-    expect(project(id).project.tasks).toHaveLength(1);
+  it('notices when the browser extension goes silent, and when it is back', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    const events: CompanionEvent[] = [];
+    h.companion.bus.subscribe((e) => events.push(e));
 
-    h.companion.settings.update({ maxTasksPerSession: 2 });
-    const second = await proposeTask(id, { title: 'Run the build', instructions: 'Run npm run build and report the output.' });
-    h.companion.settings.update({ maxTasksPerSession: 1 });
-    h.companion.orchestrator.approveTask(id, second);
-    expect(rejection(() => h.companion.orchestrator.claimDispatch(id, second)).code).toBe('task_budget_reached');
-    expect(project(id).project.session).toMatchObject({ status: 'paused', pauseReason: 'task_budget' });
-    expect(project(id).project.tasks[1]?.status).toBe('approved');
+    o.relayWork();
+    expect(o.relayLink().online).toBe(true);
+    expect(o.checkRelay(Date.now() + 10_000).online).toBe(true);
+    expect(o.checkRelay(Date.now() + 60_000).online).toBe(false);
+    expect(project(id).project.timeline.some((e) => e.title === 'Browser extension is out of contact')).toBe(true);
+    expect(events.some((e) => e.type === 'relay' && !e.relay.online)).toBe(true);
 
-    h.companion.orchestrator.controlSession(id, 'resume');
-    expect(project(id).project.session).toMatchObject({ status: 'running', tasksDispatched: 0 });
-    expect(h.companion.orchestrator.claimDispatch(id, second).prompt).toContain('Run the build');
+    o.relayWork();
+    expect(o.relayLink().online).toBe(true);
+    expect(project(id).project.timeline.some((e) => e.title === 'Browser extension is back in contact')).toBe(true);
   });
 });
 
 describe('evaluation of Arena results', () => {
   it('forces a structured verdict, grounds it in the real reply, and updates progress', async () => {
-    const id = newProject();
     h.fake.enqueue(
-      toolResponse([{ name: 'set_plan', args: { milestones: [{ title: 'Login form', description: 'Form exists and is tested' }, { title: 'Session handling' }] } }]),
-      toolResponse([{ name: 'propose_arena_task', args: { ...PROPOSAL, milestone_id: 'M-1' } }]),
-      textResponse('Plan set and first task proposed.'),
+      toolResponse([
+        { name: 'set_plan', args: { milestones: [{ title: 'Login form' }, { title: 'Sessions' }] } },
+        { name: 'dispatch_arena_task', args: TASK },
+      ]),
+      textResponse('Sent.'),
     );
-    await say(id, 'Build the login flow.');
-    expect(project(id).project.milestones.map((m) => [m.id, m.status])).toEqual([
-      ['M-1', 'in_progress'],
-      ['M-2', 'pending'],
-    ]);
-    const dispatchId = deliver(id, 'T-1');
+    const id = start();
+    await settle(id);
+    deliver(id);
 
     h.fake.enqueue(
       toolResponse([
         {
           name: 'evaluate_arena_result',
-          args: {
-            task_id: 'T-1',
-            verdict: 'complete',
-            summary: 'The form was created and both checks are reported as passing.',
-            evidence: ['Ran `npm test`: 14 passed, 0 failed.', 'build completed without errors'],
-          },
+          args: { task_id: 'T-1', verdict: 'complete', summary: 'Tests and build pass.', evidence: ['Ran `npm test`: 14 passed, 0 failed.', 'build completed without errors'], missing: [] },
         },
       ]),
       toolResponse([
-        { name: 'update_milestone', args: { milestone_id: 'M-1', status: 'done', notes: 'Verified by T-1' } },
-        { name: 'record_decision', args: { summary: 'Forms live in src/components', rationale: 'Arena placed LoginForm there.' } },
+        { name: 'update_milestone', args: { milestone_id: 'M-1', status: 'done' } },
+        { name: 'dispatch_arena_task', args: NEXT_TASK },
       ]),
-      textResponse('T-1 is verified. Next is session handling.'),
+      textResponse('The login form is verified.'),
     );
-    h.companion.orchestrator.recordArenaResponse(id, 'T-1', { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    expect(project(id).project.tasks[0]?.status).toBe('evaluating');
-    await h.companion.orchestrator.whenIdle(id);
+    reply(id);
+    await settle(id);
 
-    // First evaluation request: Gemini must call the evaluation tool and sees the verbatim reply as quoted data.
-    const evalRequest = h.fake.generateRequests.find((r) => JSON.stringify(r.body.contents.at(-1)).includes('ARENA_RESPONSE_BEGIN'))!;
-    expect(evalRequest.body.toolConfig.functionCallingConfig).toEqual({ mode: 'ANY', allowedFunctionNames: ['evaluate_arena_result'] });
-    const handed = evalRequest.body.contents.at(-1).parts[0].text as string;
-    expect(handed).toContain('[AgentLink] Arena has replied to task T-1');
-    expect(handed).toContain(ARENA_REPLY);
-    expect(handed).toMatch(/<<<ARENA_RESPONSE_BEGIN [0-9a-f]{12}>>>/);
-    // Later rounds in the same turn are free-form again.
-    expect(h.fake.lastGenerate().body.toolConfig.functionCallingConfig.mode).toBe('AUTO');
+    const evaluationRequest = h.fake.generateRequests[2]?.body;
+    // The first evaluation round may call nothing but the evaluation tool.
+    expect(evaluationRequest.toolConfig.functionCallingConfig).toMatchObject({ mode: 'ANY', allowedFunctionNames: ['evaluate_arena_result'] });
+    const prompt = requestTexts(2);
+    expect(prompt).toContain(ARENA_REPLY);
+    expect(prompt).toContain('ARENA_RESPONSE_BEGIN');
 
-    const view = project(id);
-    const task = view.project.tasks[0]!;
-    expect(task.status).toBe('completed');
-    expect(task.evaluation).toMatchObject({ verdict: 'complete', model: 'gemini-4-hydrogen', evidence: ['Ran `npm test`: 14 passed, 0 failed.', 'build completed without errors'] });
-    expect(task.arenaResponse).toMatchObject({ text: ARENA_REPLY, source: 'auto', chars: ARENA_REPLY.length, truncated: false });
-    expect(view.project.currentTaskId).toBeNull();
-    expect(view.project.milestones[0]).toMatchObject({ status: 'done', notes: 'Verified by T-1' });
-    expect(view.project.currentMilestoneId).toBe('M-2');
-    expect(view.project.decisions[0]).toMatchObject({ id: 'D-1', summary: 'Forms live in src/components' });
-    expect(view.conversation.at(-1)?.text).toBe('T-1 is verified. Next is session handling.');
-    expect(view.conversation.map((e) => e.kind)).toContain('arena_result');
+    const done = task(id);
+    expect(done.status).toBe('completed');
+    expect(done.evaluation).toMatchObject({ verdict: 'complete', summary: 'Tests and build pass.' });
+    expect(done.evaluation?.evidence).toHaveLength(2);
+    const view = project(id).project;
+    expect(view.milestones[0]?.status).toBe('done');
+    expect(view.currentTaskId).toBe('T-2');
   });
 
   it('refuses a "complete" verdict whose evidence is not in the reply', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
+    const id = await startedWithTask();
+    deliver(id);
     h.fake.enqueue(
-      // Fabricated evidence: these words are not in Arena's reply.
-      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'complete', summary: 'All done.', evidence: ['All 200 tests passed and the app was deployed to production'] } }]),
-      // Corrected after the refusal.
-      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'partial', summary: 'Tests pass; deployment is not shown.', evidence: ['14 passed, 0 failed'], missing: ['Deployment'] } }]),
-      textResponse('Partially done.'),
+      evaluates('T-1', 'complete', ['All 250 tests passed and the deployment succeeded.']),
+      evaluates('T-1', 'partial', ['Ran `npm test`: 14 passed, 0 failed.']),
+      ...dispatches(NEXT_TASK),
     );
-    h.companion.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
+    reply(id);
+    await settle(id);
 
-    const requests = h.fake.generateRequests.slice(-3);
-    const refusal = requests[1]!.body.contents.at(-1).parts[0].functionResponse.response;
-    expect(refusal.ok).toBe(false);
-    expect(refusal.error).toContain('do not appear in Arena\'s reply');
-    // Still unevaluated, so the next round is forced to evaluate again.
-    expect(requests[1]!.body.toolConfig.functionCallingConfig.mode).toBe('ANY');
-
-    const task = project(id).project.tasks[0]!;
-    expect(task.status).toBe('partial');
-    expect(task.evaluation).toMatchObject({ verdict: 'partial', missing: ['Deployment'] });
-    expect(project(id).conversation.at(-1)?.actions.map((a) => a.ok)).toEqual([false, true]);
+    const actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'evaluate_arena_result');
+    expect(actions.map((a) => a.ok)).toEqual([false, true]);
+    expect(actions[0]?.summary).toContain('do not appear');
+    expect(task(id).status).toBe('partial');
   });
 
   it('never marks a task complete without evidence, even if Gemini insists', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
-    const insist = () => toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'complete', summary: 'Done.', evidence: [] } }]);
-    h.fake.enqueue(insist(), insist(), insist(), textResponse('It is complete, trust me.'));
-    h.companion.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text: 'I will start working on this soon.', source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.fallback = () => evaluates('T-1', 'complete', []);
+    reply(id, 'T-1', 'ok');
+    await waitFor(() => project(id).project.session.status === 'blocked', 'the session to hand back control', 5_000);
 
-    const task = project(id).project.tasks[0]!;
-    expect(task.status).toBe('evaluating');
-    expect(task.evaluation).toBeNull();
-    expect(task.evaluationError).toContain('without recording a verdict');
-    expect(project(id).project.timeline.some((e) => e.title === 'Evaluation of T-1 did not finish')).toBe(true);
-
-    // The user can ask for the evaluation to be run again.
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'unclear', summary: 'Only an intention was stated.', evidence: ['I will start working on this soon.'] } }]), textResponse('Unclear.'));
-    h.companion.orchestrator.retryEvaluation(id, taskId);
-    await h.companion.orchestrator.whenIdle(id);
-    expect(project(id).project.tasks[0]).toMatchObject({ status: 'inconclusive', evaluationError: null });
+    expect(task(id).status).toBe('evaluating');
+    expect(task(id).evaluation).toBeNull();
+    const session = project(id).project.session;
+    expect(session.blocker).toMatchObject({ kind: 'coordinator', taskId: 'T-1' });
+    // Arena's reply is kept; nothing was lost.
+    expect(task(id).arenaResponse?.text).toBe('ok');
   });
 
   it('cannot evaluate a task that Arena has not answered', async () => {
-    const id = newProject();
-    await proposeTask(id);
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: 'T-1', verdict: 'complete', summary: 'Done', evidence: ['made up quote'] } }]), textResponse('Hm.'));
-    await say(id, 'just mark it done');
-    expect(project(id).project.tasks[0]?.status).toBe('proposed');
-    const action = project(id).conversation.at(-1)!.actions[0]!;
-    expect(action.ok).toBe(false);
-    expect(action.summary).toContain('no reply from Arena');
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: TASK }]), evaluates('T-1'), textResponse('I will wait for Arena.'));
+    const id = start();
+    await settle(id);
+    const action = project(id).conversation.flatMap((e) => e.actions).find((a) => a.name === 'evaluate_arena_result');
+    expect(action?.ok).toBe(false);
+    expect(action?.summary).toContain('no reply from Arena yet');
+    expect(task(id).status).toBe('queued');
   });
 
-  it('keeps the evaluation pending when the Gemini call fails, and reports why', async () => {
-    h.companion.settings.update({ maxRetries: 0 });
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
-    h.fake.enqueue({ kind: 'error', status: 503, body: errorBody(503, 'UNAVAILABLE', 'Overloaded.') });
-    h.companion.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
-    const task = project(id).project.tasks[0]!;
-    expect(task.status).toBe('evaluating');
-    expect(task.arenaResponse?.text).toBe(ARENA_REPLY);
-    expect(task.evaluationError).toContain('Overloaded.');
+  it('retries a review by itself when the Gemini call fails, and keeps the reply meanwhile', async () => {
+    const id = await startedWithTask();
+    deliver(id);
+    const unavailable: ScriptedOrFn = { kind: 'error', status: 503, body: errorBody(503, 'UNAVAILABLE', 'The model is overloaded.') };
+    // Three failed requests exhaust one turn (two retries inside the client); the next turn succeeds.
+    h.fake.enqueue(unavailable, unavailable, unavailable, evaluates('T-1'), ...dispatches(NEXT_TASK));
+    reply(id);
+    await waitFor(() => task(id).status === 'completed', 'the review to succeed after a retry', 5_000);
+    await settle(id);
+
+    expect(project(id).project.timeline.some((e) => e.title.startsWith('Gemini request failed; retrying'))).toBe(true);
+    expect(project(id).project.session.status).toBe('running');
+    expect(task(id, 'T-2').status).toBe('queued');
+  });
+
+  it('hands back control with the reason when Gemini keeps failing, and resumes exactly there', async () => {
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.fallback = { kind: 'error', status: 503, body: errorBody(503, 'UNAVAILABLE', 'The model is overloaded.') };
+    reply(id);
+    await waitFor(() => project(id).project.session.status === 'blocked', 'the session to block', 5_000);
+
+    const session = project(id).project.session;
+    expect(session.blocker).toMatchObject({ kind: 'gemini', title: 'Gemini keeps failing', taskId: 'T-1' });
+    expect(session.blocker?.detail).toContain('The model is overloaded.');
+    expect(task(id).status).toBe('evaluating');
+
+    h.fake.fallback = () => textResponse('OK.');
+    h.fake.enqueue(evaluates('T-1'), ...dispatches(NEXT_TASK));
+    h.companion.orchestrator.controlSession(id, 'resume');
+    await settle(id);
+    expect(task(id).status).toBe('completed');
+    expect(task(id, 'T-2').status).toBe('queued');
+  });
+
+  it('stops at once, without retrying, when the API key is rejected', async () => {
+    const id = await startedWithTask();
+    deliver(id);
+    h.fake.validKeys.clear();
+    reply(id);
+    await waitFor(() => project(id).project.session.status === 'blocked', 'the session to block', 5_000);
+    expect(project(id).project.session.blocker).toMatchObject({ kind: 'gemini', title: 'Gemini cannot be used' });
+    expect(h.fake.generateRequests).toHaveLength(3);
   });
 
   it('only declares the objective complete when verified work and milestones support it', async () => {
-    const id = newProject();
-    h.fake.enqueue(toolResponse([{ name: 'mark_objective_complete', args: { summary: 'Everything works.' } }]), textResponse('Not yet.'));
-    await say(id, 'are we done?');
-    expect(project(id).project.status).toBe('active');
-    expect(project(id).conversation.at(-1)?.actions[0]).toMatchObject({ ok: false });
-    expect(project(id).conversation.at(-1)?.actions[0]?.summary).toContain('No task has been verified');
-
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
     h.fake.enqueue(
-      toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'complete', summary: 'Verified.', evidence: ['14 passed, 0 failed', 'build completed without errors'] } }]),
-      toolResponse([{ name: 'mark_objective_complete', args: { summary: 'Login flow shipped; verified by T-1.' } }]),
-      textResponse('The objective is complete.'),
+      toolResponse([
+        { name: 'set_plan', args: { milestones: [{ title: 'Login form' }] } },
+        { name: 'mark_objective_complete', args: { summary: 'All done.' } },
+        { name: 'dispatch_arena_task', args: TASK },
+      ]),
+      textResponse('Sent.'),
     );
-    h.companion.orchestrator.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await h.companion.orchestrator.whenIdle(id);
-    const view = project(id);
-    expect(view.project.status).toBe('complete');
-    expect(view.project.completion?.summary).toBe('Login flow shipped; verified by T-1.');
-    expect(view.project.session.status).toBe('completed');
+    const id = start();
+    await settle(id);
+    let actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'mark_objective_complete');
+    expect(actions[0]?.ok).toBe(false);
+    expect(project(id).project.status).toBe('active');
 
-    // A completed project does not keep generating work until the user reopens it.
-    expect(rejection(() => h.companion.orchestrator.sendMessage(id, 'one more thing')).code).toBe('session_not_running');
-    h.companion.orchestrator.controlSession(id, 'start');
-    expect(project(id).project).toMatchObject({ status: 'active', completion: null });
-    expect(project(id).project.session.status).toBe('running');
+    deliver(id);
+    h.fake.enqueue(
+      evaluates('T-1'),
+      toolResponse([{ name: 'mark_objective_complete', args: { summary: 'All done.' } }]),
+      toolResponse([
+        { name: 'update_milestone', args: { milestone_id: 'M-1', status: 'done' } },
+        { name: 'mark_objective_complete', args: { summary: 'The login flow works and is tested.' } },
+      ]),
+      textResponse('Complete.'),
+    );
+    reply(id);
+    await settle(id);
+
+    actions = project(id).conversation.flatMap((e) => e.actions).filter((a) => a.name === 'mark_objective_complete');
+    expect(actions.map((a) => a.ok)).toEqual([false, false, true]);
+    expect(actions[1]?.summary).toContain('not done');
+    const view = project(id).project;
+    expect(view.status).toBe('complete');
+    expect(view.completion?.summary).toBe('The login flow works and is tested.');
+    expect(view.session.status).toBe('completed');
+  });
+
+  it('starts a new session on a completed project when the user asks for more', async () => {
+    h.fake.enqueue(toolResponse([{ name: 'dispatch_arena_task', args: TASK }]), textResponse('Sent.'));
+    const id = start();
+    await settle(id);
+    deliver(id);
+    h.fake.enqueue(evaluates('T-1'), toolResponse([{ name: 'mark_objective_complete', args: { summary: 'Done.' } }]), textResponse('Complete.'));
+    reply(id);
+    await settle(id);
+    expect(project(id).project.session.status).toBe('completed');
+
+    h.fake.enqueue(...dispatches(NEXT_TASK));
+    await say(id, 'Now add sessions as well.');
+    const view = project(id).project;
+    expect(view.status).toBe('active');
+    expect(view.session.status).toBe('running');
+    expect(task(id, 'T-2').status).toBe('queued');
   });
 });
 
 describe('pause, resume and stop', () => {
-  it('blocks Gemini and Arena while paused, and resumes cleanly', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
+  it('holds everything while paused and carries on by itself after resume', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
     o.controlSession(id, 'pause');
-    expect(project(id).project.session).toMatchObject({ status: 'paused', pauseReason: 'user' });
 
-    const before = h.fake.generateRequests.length;
-    expect(rejection(() => o.sendMessage(id, 'hello?')).code).toBe('session_not_running');
-    expect(rejection(() => o.approveTask(id, taskId)).code).toBe('session_not_running');
-    expect(h.fake.generateRequests).toHaveLength(before);
-    // Editing stays possible while paused.
-    expect(o.editTask(id, taskId, { title: 'Edited while paused' }).title).toBe('Edited while paused');
+    expect(project(id).project.session.status).toBe('paused');
+    // A queued task is not typed into Arena while paused.
+    expect(o.relayWork().items).toEqual([]);
+    expect(rejection(() => o.claimDispatch(id, 'T-1')).code).toBe('session_not_running');
+    expect(rejection(() => o.sendMessage(id, 'hello')).code).toBe('session_not_running');
+    expect(rejection(() => o.controlSession(id, 'pause')).code).toBe('invalid_transition');
 
     o.controlSession(id, 'resume');
-    o.approveTask(id, taskId);
-    expect(o.claimDispatch(id, taskId).prompt).toContain('Edited while paused');
-    expect(rejection(() => o.controlSession(id, 'resume')).code).toBe('invalid_transition');
+    expect(o.relayWork().items.map((i) => i.task.id)).toEqual(['T-1']);
+    deliver(id);
+    expect(task(id).status).toBe('awaiting_response');
   });
 
   it('pausing interrupts a reply that is being streamed', async () => {
-    const id = newProject();
-    h.fake.enqueue(textResponse('This answer is long enough to be interrupted half way through.', { pieces: 10, chunkDelayMs: 30 }));
-    const sent = h.companion.orchestrator.sendMessage(id, 'tell me a lot');
-    await waitFor(() => {
-      const last = project(id).conversation.at(-1);
-      return last?.role === 'coordinator' && last.text.length > 5;
-    }, 'the reply to start streaming');
+    const id = await startedWithTask();
+    h.fake.enqueue(textResponse('A long answer that will be interrupted before it finishes.', { pieces: 8, chunkDelayMs: 40 }));
+    const turn = h.companion.orchestrator.sendMessage(id, 'Explain the plan.');
+    await waitFor(() => (project(id).conversation.at(-1)?.text.length ?? 0) > 0, 'the reply to start streaming');
     h.companion.orchestrator.controlSession(id, 'pause');
-    await sent.done;
+    await turn.done;
+    await settle(id);
 
-    const entry = project(id).conversation.at(-1)!;
-    expect(entry.status).toBe('interrupted');
-    expect(entry.text.length).toBeGreaterThan(0);
-    expect(entry.text.length).toBeLessThan('This answer is long enough to be interrupted half way through.'.length);
-    expect(h.companion.orchestrator.turnState(id).active).toBe(false);
-
-    // After resuming, the conversation continues from a valid history that includes the partial reply.
-    h.companion.orchestrator.controlSession(id, 'resume');
-    h.fake.enqueue(textResponse('Continuing.'));
-    await say(id, 'go on');
-    const contents = h.fake.lastGenerate().body.contents;
-    expect(contents.map((c: any) => c.role)).toEqual(['user', 'model', 'user']);
-    expect(contents[1].parts[0].text).toBe(entry.text);
+    const last = project(id).conversation.at(-1);
+    expect(last).toMatchObject({ role: 'coordinator', status: 'interrupted' });
+    expect(project(id).project.session.status).toBe('paused');
   });
 
-  it('holds an Arena reply that arrives while paused and evaluates it on resume', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
+  it('keeps following a task Arena already has while paused, holds the reply, and reviews it on resume', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
+    deliver(id);
     o.controlSession(id, 'pause');
 
-    const before = h.fake.generateRequests.length;
-    o.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await o.whenIdle(id);
-    expect(h.fake.generateRequests).toHaveLength(before);
-    expect(project(id).project.tasks[0]).toMatchObject({ status: 'evaluating', evaluation: null });
-    expect(project(id).project.tasks[0]?.arenaResponse?.text).toBe(ARENA_REPLY);
+    // The extension still gets the task so the reply is not missed.
+    expect(o.relayWork().items.map((i) => i.task.id)).toEqual(['T-1']);
+    const requests = h.fake.generateRequests.length;
+    reply(id);
+    await settle(id);
+    expect(task(id).status).toBe('evaluating');
+    expect(h.fake.generateRequests).toHaveLength(requests);
 
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'complete', summary: 'ok', evidence: ['14 passed, 0 failed'] } }]), textResponse('Evaluated after resume.'));
+    h.fake.enqueue(evaluates('T-1'), ...dispatches(NEXT_TASK));
     o.controlSession(id, 'resume');
-    await o.whenIdle(id);
-    expect(project(id).project.tasks[0]?.status).toBe('completed');
+    await settle(id);
+    expect(task(id).status).toBe('completed');
+    expect(task(id, 'T-2').status).toBe('queued');
   });
 
-  it('re-runs an evaluation that was interrupted by a pause', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
+  it('re-runs a review that was interrupted by a pause', async () => {
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
+    deliver(id);
     h.fake.enqueue({ kind: 'hang' });
-    o.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' });
-    await waitFor(() => o.turnState(id).active, 'the evaluation turn to start');
+    reply(id);
+    await waitFor(() => o.turnState(id).active, 'the review to start');
     o.controlSession(id, 'pause');
-    await o.whenIdle(id);
-    expect(project(id).project.tasks[0]).toMatchObject({ status: 'evaluating', evaluationError: null });
+    await settle(id);
+    expect(task(id)).toMatchObject({ status: 'evaluating', evaluationError: null });
 
-    h.fake.enqueue(toolResponse([{ name: 'evaluate_arena_result', args: { task_id: taskId, verdict: 'complete', summary: 'ok', evidence: ['14 passed, 0 failed'] } }]), textResponse('Done.'));
+    h.fake.enqueue(evaluates('T-1'), ...dispatches(NEXT_TASK));
     o.controlSession(id, 'resume');
-    await o.whenIdle(id);
-    expect(project(id).project.tasks[0]?.status).toBe('completed');
+    await settle(id);
+    expect(task(id).status).toBe('completed');
   });
 
   it('stop ends the session, cancels the open task and ignores a late Arena reply', async () => {
-    const id = newProject();
-    const taskId = await proposeTask(id);
-    const dispatchId = deliver(id, taskId);
+    const id = await startedWithTask();
     const o = h.companion.orchestrator;
+    const dispatchId = deliver(id);
     o.controlSession(id, 'stop');
 
-    const view = project(id);
-    expect(view.project.session.status).toBe('stopped');
-    expect(view.project.tasks[0]?.status).toBe('cancelled');
-    expect(view.project.currentTaskId).toBeNull();
-    const before = h.fake.generateRequests.length;
-    expect(rejection(() => o.recordArenaResponse(id, taskId, { dispatchId, text: ARENA_REPLY, source: 'auto' })).code).toBe('invalid_state');
-    expect(rejection(() => o.sendMessage(id, 'hi')).code).toBe('session_not_running');
-    expect(rejection(() => o.claimDispatch(id, taskId)).code).toBe('session_not_running');
-    expect(h.fake.generateRequests).toHaveLength(before);
-
-    // A new session can be started, and Gemini learns what happened.
-    o.controlSession(id, 'start');
-    h.fake.enqueue(textResponse('Understood.'));
-    await say(id, 'let us continue');
-    const text = h.fake.lastGenerate().body.contents.at(-1).parts[0].text as string;
-    expect(text).toContain('The user stopped the session; task T-1');
-  });
-
-  it('stopping interrupts a running reply', async () => {
-    const id = newProject();
-    h.fake.enqueue({ kind: 'hang' });
-    const sent = h.companion.orchestrator.sendMessage(id, 'think hard');
-    await waitFor(() => h.companion.orchestrator.turnState(id).active, 'the turn to start');
-    h.companion.orchestrator.controlSession(id, 'stop');
-    await sent.done;
-    expect(project(id).conversation.at(-1)?.status).toBe('interrupted');
     expect(project(id).project.session.status).toBe('stopped');
-  });
+    expect(task(id)).toMatchObject({ status: 'cancelled', closedReason: 'The session was stopped.' });
+    expect(o.relayWork().items).toEqual([]);
+    expect(rejection(() => o.recordArenaResponse(id, 'T-1', { dispatchId, text: ARENA_REPLY, source: 'auto' })).code).toBe('invalid_state');
+    const requests = h.fake.generateRequests.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.fake.generateRequests).toHaveLength(requests);
 
-  it('a single reply can be stopped without pausing the session', async () => {
-    const id = newProject();
-    h.fake.enqueue({ kind: 'hang' });
-    const sent = h.companion.orchestrator.sendMessage(id, 'think hard');
-    await waitFor(() => h.companion.orchestrator.turnState(id).active, 'the turn to start');
-    expect(h.companion.orchestrator.cancelTurn(id)).toEqual({ cancelled: true });
-    await sent.done;
-    expect(project(id).conversation.at(-1)?.status).toBe('interrupted');
+    // A message starts a new session, and Gemini is told what happened.
+    h.fake.enqueue(...dispatches(NEXT_TASK));
+    await say(id, 'Start again with sessions.');
     expect(project(id).project.session.status).toBe('running');
-    expect(h.companion.orchestrator.cancelTurn(id)).toEqual({ cancelled: false });
+    expect(requestTexts(2)).toContain('stopped the session');
   });
 
-  it('lets the user change the objective at any time and tells Gemini about it', async () => {
-    const id = newProject();
-    h.fake.enqueue(textResponse('ok'));
-    await say(id, 'hello');
-    h.companion.orchestrator.controlSession(id, 'pause');
-    h.companion.orchestrator.updateProject(id, { objective: 'Ship login with SSO only' });
-    expect(project(id).project.objective).toBe('Ship login with SSO only');
-    h.companion.orchestrator.controlSession(id, 'resume');
-
-    h.fake.enqueue(textResponse('Noted the new objective.'));
-    await say(id, 'continue');
-    const request = h.fake.lastGenerate().body;
-    expect(request.systemInstruction.parts[0].text).toContain('Objective: Ship login with SSO only');
-    expect(request.contents.at(-1).parts[0].text).toContain('[AgentLink] The user changed the project objective. It is now: Ship login with SSO only');
+  it('stopping a single reply pauses the session, since a running session would simply go on', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    h.fake.enqueue(textResponse('A long answer that the user stops.', { pieces: 6, chunkDelayMs: 40 }));
+    const turn = o.sendMessage(id, 'Explain.');
+    await waitFor(() => (project(id).conversation.at(-1)?.text.length ?? 0) > 0, 'the reply to start streaming');
+    expect(o.cancelTurn(id)).toEqual({ cancelled: true });
+    await turn.done;
+    expect(project(id).conversation.at(-1)?.status).toBe('interrupted');
+    expect(project(id).project.session.status).toBe('paused');
+    expect(o.cancelTurn(id)).toEqual({ cancelled: false });
   });
 
-  it('stops tool loops after the configured number of rounds', async () => {
-    h.companion.settings.update({ maxToolRounds: 2 });
-    const id = newProject();
-    let n = 0;
-    h.fake.fallback = (request) => {
-      // A model that would call tools forever if allowed to.
-      if (request.body.toolConfig?.functionCallingConfig?.mode === 'NONE') return textResponse('Stopping here.');
-      n += 1;
-      return toolResponse([{ name: 'record_decision', args: { summary: `Decision number ${n}` } }]);
-    };
-    await say(id, 'decide things');
-    expect(h.fake.generateRequests).toHaveLength(3); // 2 tool rounds + 1 closing round without tools
-    expect(project(id).project.decisions).toHaveLength(2);
-    expect(project(id).conversation.at(-1)).toMatchObject({ status: 'complete', text: 'Stopping here.' });
+  it('lets the user cancel the open task; Gemini is told and picks another next step', async () => {
+    const id = await startedWithTask();
+    const o = h.companion.orchestrator;
+    deliver(id);
+    h.fake.enqueue(...dispatches(NEXT_TASK));
+    o.cancelTask(id, 'T-1');
+    await settle(id);
+
+    expect(task(id)).toMatchObject({ status: 'cancelled', closedReason: 'Cancelled by the user.' });
+    expect(requestTexts(2)).toContain('cancelled task T-1');
+    expect(task(id, 'T-2').status).toBe('queued');
+    expect(rejection(() => o.cancelTask(id, 'T-1')).code).toBe('invalid_state');
   });
 });

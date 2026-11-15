@@ -17,6 +17,8 @@ export interface CompanionOptions {
   logLevel?: LogLevel;
   logSink?: LogSink;
   gemini?: Pick<GeminiServiceOptions, 'retryBaseDelayMs' | 'retryMaxDelayMs' | 'modelCacheMs'>;
+  /** Timing of the autonomous loop; shortened in tests. */
+  orchestrator?: { retryDelaysMs?: readonly number[]; relayOfflineMs?: number };
 }
 
 export interface Companion {
@@ -56,7 +58,8 @@ export function createCompanion(config: CompanionConfig, options: CompanionOptio
 
   const scrub = (text: string): string => credentials.scrub(text);
   const coordinator = new Coordinator(gemini, () => settings.get(), scrub, logger);
-  const orchestrator = new Orchestrator({ store, gemini, coordinator, getSettings: () => settings.get(), scrub, bus, logger });
+  const orchestrator = new Orchestrator({ store, gemini, coordinator, getSettings: () => settings.get(), scrub, bus, logger, ...options.orchestrator });
+  // Sessions that were running when the companion stopped carry on by themselves.
   orchestrator.recoverAfterRestart();
 
   const server = new CompanionServer({

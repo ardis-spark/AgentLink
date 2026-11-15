@@ -1,19 +1,23 @@
-import { ARENA_URL_PATTERNS, type ContentEvent, type ContentRequest, type ExecutionStatusBroadcast, type UiRequest, type UiResult } from '../../shared/messages.js';
+import { ARENA_URL_PATTERNS, type ContentRequest, type UiRequest, type UiResult } from '../../shared/messages.js';
 import { CompanionClient } from '../lib/companionClient.js';
 import { DEFAULT_EXTENSION_SETTINGS, loadSettings, onSettingsChanged, saveSettings, type ExtensionSettings } from '../lib/settings.js';
 import { ArenaDispatcher, type BrowserTab, type TabsPort } from './dispatcher.js';
 
 /**
  * Background script: the only part of the extension that touches Arena tabs.
- * It relays between the workspace UI, the Arena adapter and the companion.
+ *
+ * It runs the relay between the companion and Arena on its own, whether or
+ * not an AgentLink page is open: every few seconds it asks the companion what
+ * is outstanding, types queued tasks into Arena, follows them until Arena has
+ * finished, and brings the replies back. Nothing here waits for a click.
  */
+
+/** How often the relay looks for work. Each look is one request to the local companion. */
+const RELAY_INTERVAL_MS = 3_000;
 
 let settings: ExtensionSettings = { ...DEFAULT_EXTENSION_SETTINGS };
 const settingsReady = loadSettings().then((loaded) => {
   settings = loaded;
-});
-onSettingsChanged((next) => {
-  settings = next;
 });
 
 const client = new CompanionClient(() => ({ url: settings.companionUrl, token: settings.pairingToken }));
@@ -49,37 +53,42 @@ const dispatcher = new ArenaDispatcher({
     settings = await saveSettings(patch);
     return settings;
   },
-  broadcast: (status) => {
-    const message: ExecutionStatusBroadcast = { type: 'agentlink:bg:execution', status };
-    // Rejects when no workspace page is open, which is fine.
-    void browser.runtime.sendMessage(message).catch(() => undefined);
-  },
+});
+
+// ------------------------------------------------------------ the relay ---
+
+function runRelay(): void {
+  void settingsReady.then(() => dispatcher.tick()).catch(() => undefined);
+}
+
+setInterval(runRelay, RELAY_INTERVAL_MS);
+runRelay();
+
+onSettingsChanged((next) => {
+  settings = next;
+  // A new pairing token or companion address may be what the relay was waiting for.
+  runRelay();
 });
 
 async function handleUi(request: UiRequest): Promise<unknown> {
   switch (request.type) {
     case 'agentlink:ui:listArenaTabs':
       return dispatcher.listTabs();
-    case 'agentlink:ui:setPreferredTab':
-      return dispatcher.setPreferredTab(request.tabId);
+    case 'agentlink:ui:setPreferredTab': {
+      const tabs = await dispatcher.setPreferredTab(request.tabId);
+      runRelay();
+      return tabs;
+    }
     case 'agentlink:ui:testArena':
       return dispatcher.test(request.tabId);
     case 'agentlink:ui:focusArenaTab':
       await dispatcher.focusTarget();
       return true;
-    case 'agentlink:ui:dispatchTask':
-      return dispatcher.dispatch(request.projectId, request.taskId);
-    case 'agentlink:ui:manualSend':
-      return dispatcher.manualSend(request.projectId, request.taskId);
+    case 'agentlink:ui:wake':
+      runRelay();
+      return dispatcher.link();
     case 'agentlink:ui:captureResponse':
       return dispatcher.capture(request.projectId, request.taskId);
-    case 'agentlink:ui:resumeWatch':
-      return dispatcher.resumeWatch(request.projectId, request.taskId);
-    case 'agentlink:ui:cancelExecution':
-      await dispatcher.cancel(request.projectId, request.taskId);
-      return true;
-    case 'agentlink:ui:getExecutionStatus':
-      return dispatcher.statuses();
     default:
       throw new Error('Unknown request.');
   }
@@ -87,30 +96,23 @@ async function handleUi(request: UiRequest): Promise<unknown> {
 
 browser.runtime.onMessage.addListener((message: unknown, sender) => {
   const type = (message as { type?: unknown } | null)?.type;
-  if (typeof type !== 'string') return undefined;
-
-  if (type.startsWith('agentlink:ui:')) {
-    // Only AgentLink's own pages may drive Arena; a content script cannot.
-    if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(''))) return undefined;
-    return handleUi(message as UiRequest).then(
-      (value): UiResult<unknown> => ({ ok: true, value }),
-      (error: unknown): UiResult<unknown> => ({ ok: false, error: error instanceof Error ? error.message : 'Something went wrong.' }),
-    );
-  }
-
-  if (type === 'agentlink:arena:progress' || type === 'agentlink:arena:response' || type === 'agentlink:arena:timeout') {
-    void dispatcher.onContentEvent(message as ContentEvent, sender.tab?.id ?? null);
-  }
-  return undefined;
+  if (typeof type !== 'string' || !type.startsWith('agentlink:ui:')) return undefined;
+  // Only AgentLink's own pages may drive Arena; a content script cannot.
+  if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(''))) return undefined;
+  return handleUi(message as UiRequest).then(
+    (value): UiResult<unknown> => ({ ok: true, value }),
+    (error: unknown): UiResult<unknown> => ({ ok: false, error: error instanceof Error ? error.message : 'Something went wrong.' }),
+  );
 });
 
+// A tab that opened, closed or finished loading may be exactly what a waiting task needs: look at once.
 browser.tabs.onRemoved.addListener((tabId) => {
-  dispatcher.tabClosed(tabId);
   if (tabId === workspaceTabId) workspaceTabId = null;
+  runRelay();
 });
 
-browser.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.status === 'complete') void dispatcher.tabReloaded(tabId);
+browser.tabs.onUpdated.addListener((_tabId, change) => {
+  if (change.status === 'complete') runRelay();
 });
 
 // ------------------------------------------------------- toolbar button ---

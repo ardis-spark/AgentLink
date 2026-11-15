@@ -103,7 +103,7 @@ describe('companion client', () => {
 
   it('passes the companion’s own explanation through on a refusal', async () => {
     const { project } = await client.createProject({ name: 'P', objective: 'O' });
-    const error = await failure(client.approveTask(project.id, 'T-9'));
+    const error = await failure(client.cancelTask(project.id, 'T-9'));
     expect([error.status, error.code]).toEqual([404, 'task_not_found']);
     expect(error.message).toContain('T-9');
   });
